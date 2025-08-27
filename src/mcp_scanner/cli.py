@@ -12,6 +12,7 @@ from .models import Report
 from .scanner import scan_server
 from .spec import load_spec
 from .http_checks import scan_http_base
+from .sse_scanner import run_checks_sse
 
 
 console = Console()
@@ -26,9 +27,20 @@ def main() -> None:
 @click.option("--url", required=True, help="Target MCP server websocket URL (ws:// or wss://)")
 @click.option("--spec", type=click.Path(exists=True, dir_okay=False), help="Path to scanner_specs.schema")
 @click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
+@click.option("--transport", type=click.Choice(["ws", "sse"]), default="ws")
 @click.option("--output", type=click.Path(dir_okay=False), help="Write report to file")
-def scan_cmd(url: str, spec: Optional[str], fmt: str, output: Optional[str]) -> None:
-    report: Report = scan_server(url, spec_path=spec)
+def scan_cmd(url: str, spec: Optional[str], fmt: str, transport: str, output: Optional[str]) -> None:
+    if transport == "ws":
+        report: Report = scan_server(url, spec_path=spec)
+    else:
+        from .spec import load_spec
+        from .models import Report
+        from pathlib import Path
+
+        spec_file = Path(spec) if spec else Path(__file__).resolve().parents[2] / "scanner_specs.schema"
+        spec_index = load_spec(spec_file)
+        findings = run_checks_sse(url, spec_index)
+        report = Report.new(target=url, findings=findings)
     if fmt == "json":
         data = report.model_dump()
         out = json.dumps(data, indent=2)
@@ -53,7 +65,7 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, output: Optional[str]) -> 
 @main.command("scan-range")
 @click.option("--host", required=True, help="Target host, e.g., localhost")
 @click.option("--ports", required=True, help="Comma or dash separated ports, e.g., 9001-9010 or 8765,9001")
-@click.option("--scheme", type=click.Choice(["ws", "wss", "http", "https"]), default="http")
+@click.option("--scheme", type=click.Choice(["ws", "wss", "http", "https", "sse"]), default="http")
 @click.option("--spec", type=click.Path(exists=True, dir_okay=False), help="Path to scanner_specs.schema")
 def scan_range_cmd(host: str, ports: str, scheme: str, spec: Optional[str]) -> None:
     spec_file = spec
@@ -78,13 +90,19 @@ def scan_range_cmd(host: str, ports: str, scheme: str, spec: Optional[str]) -> N
             target = f"{scheme}://{host}:{p}"
             report = scan_server(target, spec_path=spec_file)
             table.add_row(target, str(report.summary))
-        else:
+        elif scheme in ("http", "https"):
             base = f"{scheme}://{host}:{p}"
             findings = scan_http_base(base, spec_index)
             # Build a mini summary
             passed = sum(1 for f in findings if f.passed)
             failed = sum(1 for f in findings if not f.passed)
             table.add_row(base, f"passed={passed} failed={failed}")
+        else:  # sse
+            base = f"http://{host}:{p}"
+            findings = run_checks_sse(base, spec_index)
+            passed = sum(1 for f in findings if f.passed)
+            failed = sum(1 for f in findings if not f.passed)
+            table.add_row(base + "/sse", f"passed={passed} failed={failed}")
     console.print(table)
 
 
