@@ -12,7 +12,7 @@ from rich.table import Table
 from .models import Report
 from .scanner import scan_server
 from .spec import load_spec
-from .http_checks import scan_http_base
+from .http_checks import scan_http_base, run_full_http_checks
 from .sse_scanner import run_checks_sse
 from .stdio_scanner import scan_stdio
 from .auth import build_auth_headers
@@ -72,7 +72,7 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, transport: str, verbose: b
             fallback_http = True
 
         if fallback_http:
-            findings = scan_http_base(url, spec_index, headers=auth_headers)
+            findings = run_full_http_checks(url, spec_index, headers=auth_headers, trace=trace, verbose=verbose)
         else:
             findings = run_checks_sse(url, spec_index, trace=trace, verbose=verbose, auth_headers=auth_headers if auth_headers else None)
         report = Report.new(target=url, findings=findings)
@@ -161,7 +161,7 @@ def scan_range_cmd(host: str, ports: str, scheme: str, spec: Optional[str], verb
                         use_http = True
             except Exception:
                 use_http = True
-            findings = scan_http_base(base, spec_index) if use_http else run_checks_sse(base, spec_index, trace=trace, verbose=verbose)
+            findings = (run_full_http_checks(base, spec_index) if use_http else run_checks_sse(base, spec_index, trace=trace, verbose=verbose))
             passed = sum(1 for f in findings if f.passed)
             failed = sum(1 for f in findings if not f.passed)
             table.add_row(base + "/sse", f"passed={passed} failed={failed}")
