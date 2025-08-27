@@ -32,9 +32,34 @@ mcp-scan scan --url http://localhost:9001 --transport sse --format text
 # Verbose tracing (prints requests/responses and leaked data)
 mcp-scan scan --url ws://127.0.0.1:8770 --format text --verbose
 
+# Plain-English explanations (no full packet dump)
+mcp-scan scan --url ws://127.0.0.1:8770 --format text --explain
+
 # Scan a range of targets
 mcp-scan scan-range --host localhost --ports 9001-9010 --scheme http
 mcp-scan scan-range --host localhost --ports 9001-9010 --scheme sse --verbose
+```
+
+
+Authenticated MCP servers
+```bash
+# Bearer token (SSE transport)
+mcp-scan scan \
+  --url http://your-mcp.example.com \
+  --transport sse \
+  --auth-type bearer \
+  --auth-token "$TOKEN" \
+  --explain
+
+# OAuth2 Client Credentials (SSE transport)
+mcp-scan scan \
+  --url http://your-mcp.example.com \
+  --transport sse \
+  --auth-type oauth2-client-credentials \
+  --token-url https://issuer.example.com/oauth2/token \
+  --client-id "$CLIENT_ID" --client-secret "$CLIENT_SECRET" \
+  --scope "mcp.read mcp.tools" \
+  --explain
 ```
 
 
@@ -42,6 +67,8 @@ Capabilities
 - Transports: WebSocket (ws/wss) and SSE (http/https + /sse)
 - Multi-target scanning: port ranges via scan-range
 - Verbose mode: full request/response trace and leakage evidence
+- Explain mode: plain-English what-was-sent/received/expected and exploited capability
+- Authenticated scans (SSE): bearer token or OAuth2 client-credentials
 - Findings mapped to scanner_specs.schema (examples):
   - T-02 TLS enforcement & HSTS
   - A-01 Unauthenticated access

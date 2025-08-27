@@ -23,9 +23,9 @@ def _finding(spec: SpecCheck, passed: bool, details: str) -> Finding:
     )
 
 
-def sse_send_receive(base_url: str, payload: Dict[str, Any], trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False) -> Dict[str, Any]:
+def sse_send_receive(base_url: str, payload: Dict[str, Any], trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     sse_url = base_url.rstrip("/") + "/sse"
-    with httpx.Client(timeout=5.0, follow_redirects=True) as client:
+    with httpx.Client(timeout=5.0, follow_redirects=True, headers=headers or {}) as client:
         with connect_sse(client, method="GET", url=sse_url) as event_source:
             events = event_source.iter_sse()
             post_path = None
@@ -40,7 +40,10 @@ def sse_send_receive(base_url: str, payload: Dict[str, Any], trace: Optional[Lis
             post_url = base_url.rstrip("/") + post_path
             if verbose and trace is not None:
                 trace.append({"transport": "sse", "direction": "send", "request": payload, "post_url": post_url})
-            resp = client.post(post_url, content=json.dumps(payload), headers={"content-type": "application/json"})
+            req_headers = {"content-type": "application/json"}
+            if headers:
+                req_headers.update(headers)
+            resp = client.post(post_url, content=json.dumps(payload), headers=req_headers)
             resp.raise_for_status()
             for ev in events:
                 if getattr(ev, "event", None) == "message":
@@ -56,7 +59,7 @@ def sse_send_receive(base_url: str, payload: Dict[str, Any], trace: Optional[Lis
             return {"error": "no-message"}
 
 
-def run_checks_sse(base_url: str, spec_index: Dict[str, SpecCheck], trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False) -> List[Finding]:
+def run_checks_sse(base_url: str, spec_index: Dict[str, SpecCheck], trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False, auth_headers: Optional[Dict[str, str]] = None) -> List[Finding]:
     findings: List[Finding] = []
 
     # BASE-01 initialize
@@ -68,26 +71,33 @@ def run_checks_sse(base_url: str, spec_index: Dict[str, SpecCheck], trace: Optio
             "method": "initialize",
             "params": {"capabilities": {}, "clientInfo": {"name": "mcp-security-scanner", "version": "0.1.0"}},
         }
-        resp = sse_send_receive(base_url, init, trace=trace, verbose=verbose)
+        resp = sse_send_receive(base_url, init, trace=trace, verbose=verbose, headers=auth_headers)
         ok = isinstance(resp, dict) and "result" in resp and "capabilities" in resp.get("result", {})
         findings.append(_finding(base, ok, json.dumps(resp)))
 
     # tools/list
     tools = []
-    tools_list = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}, trace=trace, verbose=verbose)
+    # If auth provided, probe unauth first to evaluate A-01
+    a01 = spec_index.get("A-01")
+    pre_tools_list = None
+    if auth_headers:
+        pre_tools_list = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}, trace=trace, verbose=verbose, headers=None)
+    tools_list = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}, trace=trace, verbose=verbose, headers=auth_headers)
     if isinstance(tools_list, dict):
         tools = tools_list.get("result", {}).get("tools", [])
 
     # A-01: if tools are accessible without auth
-    a01 = spec_index.get("A-01")
     if a01:
-        findings.append(_finding(a01, passed=(not bool(tools)), details=json.dumps(tools_list)))
+        if auth_headers:
+            unauth_tools = pre_tools_list.get("result", {}).get("tools", []) if isinstance(pre_tools_list, dict) else []
+            findings.append(_finding(a01, passed=(not bool(unauth_tools)), details=json.dumps(pre_tools_list)))
+        else:
+            findings.append(_finding(a01, passed=(not bool(tools)), details=json.dumps(tools_list)))
 
-    # P-02: Prompt/description injection heuristics
     # X-03: Rug-pull detection — re-list and diff
     x03 = spec_index.get("X-03")
     if x03:
-        tools_list2 = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 20, "method": "tools/list", "params": {}}, trace=trace, verbose=verbose)
+        tools_list2 = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 20, "method": "tools/list", "params": {}}, trace=trace, verbose=verbose, headers=auth_headers)
         tools2 = tools_list2.get("result", {}).get("tools", []) if isinstance(tools_list2, dict) else []
         diff = []
         def key(t):
@@ -143,12 +153,12 @@ def run_checks_sse(base_url: str, spec_index: Dict[str, SpecCheck], trace: Optio
     # R-01 traversal attempt via resources/read
     r01 = spec_index.get("R-01")
     if r01:
-        attempt = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "file:///../../etc/hosts"}}, trace=trace, verbose=verbose)
+        attempt = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": "file:///../../etc/hosts"}}, trace=trace, verbose=verbose, headers=auth_headers)
         accepted = "result" in attempt and isinstance(attempt.get("result"), dict)
         findings.append(_finding(r01, passed=not accepted, details=json.dumps(attempt)))
 
     # Resources listing and sensitive exposure (R-03) and templates (R-04)
-    res_list = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 10, "method": "resources/list", "params": {}}, trace=trace, verbose=verbose)
+    res_list = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 10, "method": "resources/list", "params": {}}, trace=trace, verbose=verbose, headers=auth_headers)
     resources = res_list.get("result", {}).get("resources", []) if isinstance(res_list, dict) else []
 
     # R-03 Sensitive resource exposure
@@ -162,7 +172,7 @@ def run_checks_sse(base_url: str, spec_index: Dict[str, SpecCheck], trace: Optio
             if any(k in name or k in uri for k in sensitive_keywords):
                 # try read if uri present
                 if r.get("uri"):
-                    resp = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 11, "method": "resources/read", "params": {"uri": r["uri"]}}, trace=trace, verbose=verbose)
+                    resp = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 11, "method": "resources/read", "params": {"uri": r["uri"]}}, trace=trace, verbose=verbose, headers=auth_headers)
                     text = json.dumps(resp).lower()
                     if any(x in text for x in ["password", "apikey", "api key", "sk-", "postgresql://", "username:"]):
                         suspects.append({"resource": r, "resp": resp})
@@ -170,7 +180,6 @@ def run_checks_sse(base_url: str, spec_index: Dict[str, SpecCheck], trace: Optio
                     suspects.append({"resource": r, "resp": None})
         findings.append(_finding(r03, passed=len(suspects) == 0, details=json.dumps(suspects)))
 
-    # R-04 User-controlled templates without validation
     # R-05 Private resource exposure
     r05 = spec_index.get("R-05")
     if r05:
@@ -178,11 +187,13 @@ def run_checks_sse(base_url: str, spec_index: Dict[str, SpecCheck], trace: Optio
         for r in resources:
             uri = r.get("uri")
             if isinstance(uri, str) and uri.startswith("private://"):
-                resp = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 13, "method": "resources/read", "params": {"uri": uri}}, trace=trace, verbose=verbose)
+                resp = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 13, "method": "resources/read", "params": {"uri": uri}}, trace=trace, verbose=verbose, headers=auth_headers)
                 text = json.dumps(resp).lower()
                 if any(x in text for x in ["secret", "token", "password"]):
                     leaks.append({"resource": r, "resp": resp})
         findings.append(_finding(r05, passed=len(leaks) == 0, details=json.dumps(leaks)))
+
+    # R-04 User-controlled templates without validation
     r04 = spec_index.get("R-04")
     if r04:
         templates = [r for r in resources if isinstance(r, dict) and r.get("uriTemplate")]
@@ -197,7 +208,7 @@ def run_checks_sse(base_url: str, spec_index: Dict[str, SpecCheck], trace: Optio
                     # fallback: replace first {...} with 'test'
                     base = tmpl.split("{", 1)[0]
                     probe = base + "test"
-                resp = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 12, "method": "resources/read", "params": {"uri": probe}}, trace=trace, verbose=verbose)
+                resp = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 12, "method": "resources/read", "params": {"uri": probe}}, trace=trace, verbose=verbose, headers=auth_headers)
                 text = json.dumps(resp)
                 if "No notes found for user:" in text or "Notes for" in text or resp.get("result"):
                     issues.append({"template": tmpl, "probe": probe, "resp": resp})

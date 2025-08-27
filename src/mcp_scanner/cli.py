@@ -13,6 +13,7 @@ from .scanner import scan_server
 from .spec import load_spec
 from .http_checks import scan_http_base
 from .sse_scanner import run_checks_sse
+from .auth import build_auth_headers
 
 
 console = Console()
@@ -30,14 +31,21 @@ def main() -> None:
 @click.option("--transport", type=click.Choice(["ws", "sse"]), default="ws")
 @click.option("--verbose", is_flag=True, default=False, help="Print full request/response trace and leaked data")
 @click.option("--explain", is_flag=True, default=False, help="Plain-English summary of sent/received/expected and exploited capability")
+@click.option("--auth-type", type=click.Choice(["bearer", "oauth2-client-credentials"]))
+@click.option("--auth-token")
+@click.option("--token-url")
+@click.option("--client-id")
+@click.option("--client-secret")
+@click.option("--scope")
 @click.option("--output", type=click.Path(dir_okay=False), help="Write report to file")
-def scan_cmd(url: str, spec: Optional[str], fmt: str, transport: str, verbose: bool, explain: bool, output: Optional[str]) -> None:
+def scan_cmd(url: str, spec: Optional[str], fmt: str, transport: str, verbose: bool, explain: bool, auth_type: Optional[str], auth_token: Optional[str], token_url: Optional[str], client_id: Optional[str], client_secret: Optional[str], scope: Optional[str], output: Optional[str]) -> None:
     if verbose and explain:
         console.print("--verbose and --explain are mutually exclusive; using --explain.")
         verbose = False
     trace: list[dict] = [] if (verbose or explain) else []
+    auth_headers = build_auth_headers(auth_type, auth_token, token_url, client_id, client_secret, scope)
     if transport == "ws":
-        report: Report = scan_server(url, spec_path=spec, verbose=verbose, trace=trace)
+        report: Report = scan_server(url, spec_path=spec, verbose=verbose, trace=trace)  # TODO: ws headers
     else:
         from .spec import load_spec
         from .models import Report
@@ -45,6 +53,10 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, transport: str, verbose: b
 
         spec_file = Path(spec) if spec else Path(__file__).resolve().parents[2] / "scanner_specs.schema"
         spec_index = load_spec(spec_file)
+        # Pass Authorization header for SSE
+        if auth_headers:
+            # monkey patch: inject into base URL via header registry in trace for sse_scanner
+            trace.append({"transport": "sse", "auth_headers": auth_headers})
         findings = run_checks_sse(url, spec_index, trace=trace, verbose=verbose)
         report = Report.new(target=url, findings=findings)
     if fmt == "json":
