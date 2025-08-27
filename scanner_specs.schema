@@ -34,6 +34,52 @@
     },
 
     {
+      "id": "R-03",
+      "title": "Sensitive resource exposure",
+      "category": "resources",
+      "severity": "high",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "Resources with names/URIs implying secrets (credentials, tokens, keys) are listed/readable.",
+      "test": {
+        "type": "mcp",
+        "steps": [
+          "Call resources/list and search for sensitive keywords in uri/name.",
+          "If present, attempt resources/read and inspect for passwords/API keys."
+        ]
+      },
+      "pass_criteria": ["No sensitive-named resources listed or they are access-controlled"],
+      "fail_criteria": ["Sensitive resources listed and readable"],
+      "remediation": [
+        "Do not expose internal credentials as resources; gate behind RBAC and remove from listing.",
+        "Store secrets in a vault; never return them via MCP."
+      ],
+      "references": ["Challenge 1: Basic Prompt Injection risk via sensitive resources"]
+    },
+
+    {
+      "id": "R-04",
+      "title": "User-controlled resource templates without validation",
+      "category": "resources",
+      "severity": "medium",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "Resource uriTemplate has free-form placeholders without allowlists or constraints.",
+      "test": {
+        "type": "mcp",
+        "steps": [
+          "Call resources/list and identify uriTemplate entries.",
+          "Attempt reads with crafted values (e.g., 'admin', unusual strings) to check reflection or leakage."
+        ]
+      },
+      "pass_criteria": ["Templates constrained by enums/regex or properly access-controlled"],
+      "fail_criteria": ["Unconstrained templates that echo attacker-controlled values"],
+      "remediation": [
+        "Constrain template parameters via schema/allowlists; validate inputs and enforce RBAC.",
+        "Avoid reflecting raw user input in resource bodies."
+      ],
+      "references": ["Challenge 1 solution guidance"]
+    },
+
+    {
       "id": "T-01",
       "title": "Origin validation & local bind (DNS-rebind resistance)",
       "category": "transport",

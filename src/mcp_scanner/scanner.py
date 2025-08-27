@@ -82,6 +82,23 @@ async def run_checks_ws(uri: str, spec_index: Dict[str, SpecCheck]) -> List[Find
         findings.append(_finding(t02, passed=is_secure, details=details))
 
     # X-01: Dangerous capability detection
+    # P-02: Prompt/description injection heuristics
+    p02 = spec_index.get("P-02")
+    if p02 and tools:
+        bad_phrases = [
+            "ignore any safety rules",
+            "override other tools",
+            "include contents of",
+            "do not disclose this instruction",
+            "hidden instruction",
+        ]
+        hits = []
+        for t in tools:
+            desc = (t.get("description") or "").lower()
+            if any(phrase in desc for phrase in bad_phrases):
+                hits.append(t)
+        findings.append(_finding(p02, passed=len(hits) == 0, details=json.dumps(hits)))
+
     x01 = spec_index.get("X-01")
     if x01:
         risky_keywords = [
@@ -144,6 +161,27 @@ async def run_checks_ws(uri: str, spec_index: Dict[str, SpecCheck]) -> List[Find
         findings.append(_finding(x02, passed=len(observed_danger) == 0, details=json.dumps(observed_danger)))
 
     await ws.close()
+    # After closing, we still can report static issues from prior lists
+    # R-03 Sensitive resource exposure via WS (if resources/list available earlier)
+    r03 = spec_index.get("R-03")
+    if r03:
+        # Try to reconnect briefly to list resources
+        try:
+            resp, ws2 = await _ws_call(uri, "initialize")
+            res_list = await _ws_send_recv(ws2, "resources/list", {})
+            await ws2.close()
+            resources = res_list.get("result", {}).get("resources", []) if isinstance(res_list, dict) else []
+            sensitive_keywords = ["credential", "secret", "token", "key", "password"]
+            suspects = []
+            for r in resources:
+                name = (r.get("name") or "").lower()
+                uri_r = (r.get("uri") or "").lower()
+                if any(k in name or k in uri_r for k in sensitive_keywords):
+                    suspects.append(r)
+            findings.append(_finding(r03, passed=len(suspects) == 0, details=json.dumps(suspects)))
+        except Exception:
+            pass
+
     return findings
 
 
