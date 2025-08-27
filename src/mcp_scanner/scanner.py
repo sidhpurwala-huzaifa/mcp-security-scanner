@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import websockets
 
@@ -11,12 +11,16 @@ from .models import Finding, Report, Severity
 from .spec import SpecCheck, load_spec
 
 
-async def _ws_call(uri: str, method: str, params: Dict[str, Any] | None = None, headers: Dict[str, str] | None = None) -> Tuple[Dict[str, Any], websockets.WebSocketClientProtocol]:
+async def _ws_call(uri: str, method: str, params: Dict[str, Any] | None = None, headers: Dict[str, str] | None = None, trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False) -> Tuple[Dict[str, Any], websockets.WebSocketClientProtocol]:
     # websockets client: use defaults; headers unused for now
     websocket = await websockets.connect(uri)
     req = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
+    if verbose and trace is not None:
+        trace.append({"transport": "ws", "direction": "send", "request": req})
     await websocket.send(json.dumps(req))
     raw = await websocket.recv()
+    if verbose and trace is not None:
+        trace.append({"transport": "ws", "direction": "recv", "raw": raw})
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -24,10 +28,14 @@ async def _ws_call(uri: str, method: str, params: Dict[str, Any] | None = None, 
     return data, websocket
 
 
-async def _ws_send_recv(ws: websockets.WebSocketClientProtocol, method: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
+async def _ws_send_recv(ws: websockets.WebSocketClientProtocol, method: str, params: Dict[str, Any] | None = None, trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False) -> Dict[str, Any]:
     req = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
+    if verbose and trace is not None:
+        trace.append({"transport": "ws", "direction": "send", "request": req})
     await ws.send(json.dumps(req))
     raw = await ws.recv()
+    if verbose and trace is not None:
+        trace.append({"transport": "ws", "direction": "recv", "raw": raw})
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
@@ -47,13 +55,13 @@ def _finding(spec: SpecCheck, passed: bool, details: str) -> Finding:
     )
 
 
-async def run_checks_ws(uri: str, spec_index: Dict[str, SpecCheck]) -> List[Finding]:
+async def run_checks_ws(uri: str, spec_index: Dict[str, SpecCheck], trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False) -> List[Finding]:
     findings: List[Finding] = []
 
     # BASE-01: Fingerprint
     base = spec_index.get("BASE-01")
     if base:
-        resp, ws = await _ws_call(uri, "initialize")
+        resp, ws = await _ws_call(uri, "initialize", trace=trace, verbose=verbose)
         ok = isinstance(resp, dict) and "result" in resp and "capabilities" in resp.get("result", {})
         details = json.dumps(resp)
         findings.append(_finding(base, ok, details))
@@ -65,7 +73,7 @@ async def run_checks_ws(uri: str, spec_index: Dict[str, SpecCheck]) -> List[Find
         return findings
 
     # Get tools list
-    tools_list = await _ws_send_recv(ws, "tools/list")
+    tools_list = await _ws_send_recv(ws, "tools/list", trace=trace, verbose=verbose)
     tools = tools_list.get("result", {}).get("tools", []) if isinstance(tools_list, dict) else []
 
     # A-01: Unauthenticated access
@@ -123,14 +131,14 @@ async def run_checks_ws(uri: str, spec_index: Dict[str, SpecCheck]) -> List[Find
     # R-01: Resource traversal
     r01 = spec_index.get("R-01")
     if r01:
-        attempt = await _ws_send_recv(ws, "resources/read", {"uri": "file:///../../etc/hosts"})
+        attempt = await _ws_send_recv(ws, "resources/read", {"uri": "file:///../../etc/hosts"}, trace=trace, verbose=verbose)
         accepted = "result" in attempt and isinstance(attempt.get("result"), dict)
         findings.append(_finding(r01, passed=not accepted, details=json.dumps(attempt)))
 
     # R-02: Per-resource access control
     r02 = spec_index.get("R-02")
     if r02:
-        attempt2 = await _ws_send_recv(ws, "resources/read", {"uri": "file:///etc/passwd"})
+        attempt2 = await _ws_send_recv(ws, "resources/read", {"uri": "file:///etc/passwd"}, trace=trace, verbose=verbose)
         accepted2 = "result" in attempt2 and isinstance(attempt2.get("result"), dict)
         findings.append(_finding(r02, passed=not accepted2, details=json.dumps(attempt2)))
 
@@ -152,7 +160,7 @@ async def run_checks_ws(uri: str, spec_index: Dict[str, SpecCheck]) -> List[Find
             if not (name and str_param):
                 continue
             for pl in payloads:
-                resp = await _ws_send_recv(ws, "tools/call", {"name": name, "arguments": {str_param: pl}})
+                resp = await _ws_send_recv(ws, "tools/call", {"name": name, "arguments": {str_param: pl}}, trace=trace, verbose=verbose)
                 # If server echoes or returns command/system info, treat as dangerous
                 text = json.dumps(resp).lower()
                 if any(key in text for key in ["uid=", "linux", "root:x:", "etc/passwd", "meta-data", "insecure", "stdout"]):
@@ -167,8 +175,8 @@ async def run_checks_ws(uri: str, spec_index: Dict[str, SpecCheck]) -> List[Find
     if r03:
         # Try to reconnect briefly to list resources
         try:
-            resp, ws2 = await _ws_call(uri, "initialize")
-            res_list = await _ws_send_recv(ws2, "resources/list", {})
+            resp, ws2 = await _ws_call(uri, "initialize", trace=trace, verbose=verbose)
+            res_list = await _ws_send_recv(ws2, "resources/list", {}, trace=trace, verbose=verbose)
             await ws2.close()
             resources = res_list.get("result", {}).get("resources", []) if isinstance(res_list, dict) else []
             sensitive_keywords = ["credential", "secret", "token", "key", "password"]
@@ -185,10 +193,10 @@ async def run_checks_ws(uri: str, spec_index: Dict[str, SpecCheck]) -> List[Find
     return findings
 
 
-def scan_server(uri: str, spec_path: str | None = None) -> Report:
+def scan_server(uri: str, spec_path: str | None = None, verbose: bool = False, trace: Optional[List[Dict[str, Any]]] = None) -> Report:
     spec_file = Path(spec_path) if spec_path else Path(__file__).resolve().parents[2] / "scanner_specs.schema"
     spec_index = load_spec(spec_file)
-    findings = asyncio.run(run_checks_ws(uri, spec_index))
+    findings = asyncio.run(run_checks_ws(uri, spec_index, trace=trace, verbose=verbose))
     return Report.new(target=uri, findings=findings)
 
 
