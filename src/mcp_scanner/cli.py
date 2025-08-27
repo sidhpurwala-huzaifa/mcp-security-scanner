@@ -29,9 +29,13 @@ def main() -> None:
 @click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
 @click.option("--transport", type=click.Choice(["ws", "sse"]), default="ws")
 @click.option("--verbose", is_flag=True, default=False, help="Print full request/response trace and leaked data")
+@click.option("--explain", is_flag=True, default=False, help="Plain-English summary of sent/received/expected and exploited capability")
 @click.option("--output", type=click.Path(dir_okay=False), help="Write report to file")
-def scan_cmd(url: str, spec: Optional[str], fmt: str, transport: str, verbose: bool, output: Optional[str]) -> None:
-    trace: list[dict] = [] if verbose else []
+def scan_cmd(url: str, spec: Optional[str], fmt: str, transport: str, verbose: bool, explain: bool, output: Optional[str]) -> None:
+    if verbose and explain:
+        console.print("--verbose and --explain are mutually exclusive; using --explain.")
+        verbose = False
+    trace: list[dict] = [] if (verbose or explain) else []
     if transport == "ws":
         report: Report = scan_server(url, spec_path=spec, verbose=verbose, trace=trace)
     else:
@@ -66,6 +70,10 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, transport: str, verbose: b
             console.rule("Trace")
             for entry in trace:
                 console.print(entry)
+        if explain:
+            console.rule("Explanation")
+            for line in _explain_findings(report, trace):
+                console.print(f"- {line}")
 
 
 @main.command("scan-range")
@@ -74,7 +82,8 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, transport: str, verbose: b
 @click.option("--scheme", type=click.Choice(["ws", "wss", "http", "https", "sse"]), default="http")
 @click.option("--spec", type=click.Path(exists=True, dir_okay=False), help="Path to scanner_specs.schema")
 @click.option("--verbose", is_flag=True, default=False, help="Print full request/response trace and leaked data")
-def scan_range_cmd(host: str, ports: str, scheme: str, spec: Optional[str], verbose: bool) -> None:
+@click.option("--explain", is_flag=True, default=False, help="Plain-English summary of sent/received/expected and exploited capability")
+def scan_range_cmd(host: str, ports: str, scheme: str, spec: Optional[str], verbose: bool, explain: bool) -> None:
     spec_file = spec
     if spec_file is None:
         from pathlib import Path
@@ -93,7 +102,7 @@ def scan_range_cmd(host: str, ports: str, scheme: str, spec: Optional[str], verb
     table.add_column("Target")
     table.add_column("Findings summary")
     for p in ports_list:
-        trace: list[dict] = [] if verbose else []
+        trace: list[dict] = [] if (verbose or explain) else []
         if scheme in ("ws", "wss"):
             target = f"{scheme}://{host}:{p}"
             report = scan_server(target, spec_path=spec_file, verbose=verbose, trace=trace)
@@ -112,5 +121,78 @@ def scan_range_cmd(host: str, ports: str, scheme: str, spec: Optional[str], verb
             failed = sum(1 for f in findings if not f.passed)
             table.add_row(base + "/sse", f"passed={passed} failed={failed}")
     console.print(table)
+    if explain and scheme in ("ws", "sse"):
+        console.rule("Explanation")
+        console.print("Re-run single-target scan with --explain for detailed narrative.")
+
+
+def _explain_findings(report: Report, trace: list[dict]) -> list[str]:
+    explanations: list[str] = []
+    # index first send/recv by method for reference
+    first_send: dict[str, dict] = {}
+    first_recv: dict[str, dict] = {}
+    for entry in trace:
+        if entry.get("direction") == "send":
+            req = entry.get("request") or {}
+            method = req.get("method")
+            if method and method not in first_send:
+                first_send[method] = req
+        elif entry.get("direction") == "recv":
+            data = entry.get("data") or entry.get("raw")
+            # Cannot reliably map to method; store generically
+            if isinstance(data, dict):
+                method = data.get("result", {}).get("method") or data.get("method")
+                if method and method not in first_recv:
+                    first_recv[method] = data
+    for f in report.findings:
+        sent = ""
+        received = ""
+        expected = ""
+        exploited = f.title
+        if f.id == "A-01":
+            sent = "Called tools/list without auth"
+            received = "Server returned tool list"
+            expected = "401 or denial when unauthenticated"
+        elif f.id == "T-02":
+            sent = "Checked scheme"
+            received = f.details
+            expected = "HTTPS/WSS with HSTS"
+        elif f.id == "X-01":
+            sent = "Parsed tools/list and schemas"
+            received = "Found high-risk tool(s) lacking constraints" if not f.passed else "No risky unconstrained tools"
+            expected = "Destructive tools should be gated and constrained"
+        elif f.id == "P-02":
+            sent = "Scanned tool descriptions"
+            received = "Detected manipulative hidden instructions" if not f.passed else "No injection-style instructions"
+            expected = "Descriptions free of meta-instructions"
+        elif f.id == "X-03":
+            sent = "Listed tools twice"
+            received = "Descriptions/names changed between listings" if not f.passed else "No changes detected"
+            expected = "Stable, versioned tool metadata"
+        elif f.id == "R-01":
+            sent = "resources/read with ../../ path traversal"
+            received = "Traversal accepted" if not f.passed else "Traversal blocked"
+            expected = "Reject escaped/invalid URIs"
+        elif f.id == "R-03":
+            sent = "Listed resources and read sensitive URIs"
+            received = "Secrets or credentials present" if not f.passed else "No sensitive exposure"
+            expected = "Do not list/read internal credentials"
+        elif f.id == "R-04":
+            sent = "Probed uriTemplate with crafted values"
+            received = "Unconstrained template reflected/leaked data" if not f.passed else "Templates constrained/blocked"
+            expected = "Validate inputs and constrain templates"
+        elif f.id == "R-05":
+            sent = "Read private:// resources"
+            received = "Private data readable" if not f.passed else "Private namespaces not readable"
+            expected = "Enforce RBAC and hide private namespaces"
+        else:
+            sent = "Performed check"
+            received = "See details"
+            expected = "Per spec"
+        status = "FAILED" if not f.passed else "PASSED"
+        explanations.append(
+            f"{f.id} ({status}): Sent: {sent}. Received: {received}. Expected: {expected}. Exploited: {exploited}."
+        )
+    return explanations
 
 
