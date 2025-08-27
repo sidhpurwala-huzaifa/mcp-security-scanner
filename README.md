@@ -31,6 +31,10 @@ mcp-scan scan --url ws://127.0.0.1:8765 --format json --output report.json
 # SSE transport (against SSE-capable servers)
 mcp-scan scan --url http://localhost:9001 --transport sse --format text
 
+# stdio transport (MCP over stdin/stdout)
+# Pass the stdio command in --url
+mcp-scan scan --transport stdio --url "python path/to/your_stdio_mcp.py" --format text
+
 # Verbose tracing (prints requests/responses and leaked data)
 mcp-scan scan --url ws://127.0.0.1:8770 --format text --verbose
 
@@ -66,7 +70,7 @@ mcp-scan scan \
 
 
 Capabilities
-- Transports: WebSocket (ws/wss) and SSE (http/https + /sse)
+- Transports: WebSocket (ws/wss), SSE (http/https + /sse), and stdio
 - Multi-target scanning: port ranges via scan-range
 - Verbose mode: full request/response trace and leakage evidence
 - Explain mode: plain-English what-was-sent/received/expected and exploited capability

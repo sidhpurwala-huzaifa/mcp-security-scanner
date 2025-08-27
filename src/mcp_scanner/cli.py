@@ -13,6 +13,7 @@ from .scanner import scan_server
 from .spec import load_spec
 from .http_checks import scan_http_base
 from .sse_scanner import run_checks_sse
+from .stdio_scanner import scan_stdio
 from .auth import build_auth_headers
 
 
@@ -46,7 +47,7 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, transport: str, verbose: b
     auth_headers = build_auth_headers(auth_type, auth_token, token_url, client_id, client_secret, scope)
     if transport == "ws":
         report: Report = scan_server(url, spec_path=spec, verbose=verbose, trace=trace)  # TODO: ws headers
-    else:
+    elif transport == "sse":
         from .spec import load_spec
         from .models import Report
         from pathlib import Path
@@ -59,6 +60,12 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, transport: str, verbose: b
             trace.append({"transport": "sse", "auth_headers": auth_headers})
         findings = run_checks_sse(url, spec_index, trace=trace, verbose=verbose)
         report = Report.new(target=url, findings=findings)
+    else:  # stdio
+        from .spec import load_spec
+        from pathlib import Path
+        spec_file = Path(spec) if spec else Path(__file__).resolve().parents[2] / "scanner_specs.schema"
+        spec_index = load_spec(spec_file)
+        report = scan_stdio(url, spec_index)
     if fmt == "json":
         data = report.model_dump()
         out = json.dumps(data, indent=2)
@@ -126,12 +133,18 @@ def scan_range_cmd(host: str, ports: str, scheme: str, spec: Optional[str], verb
             passed = sum(1 for f in findings if f.passed)
             failed = sum(1 for f in findings if not f.passed)
             table.add_row(base, f"passed={passed} failed={failed}")
-        else:  # sse
+        elif scheme == "sse":
             base = f"http://{host}:{p}"
             findings = run_checks_sse(base, spec_index, trace=trace, verbose=verbose)
             passed = sum(1 for f in findings if f.passed)
             failed = sum(1 for f in findings if not f.passed)
             table.add_row(base + "/sse", f"passed={passed} failed={failed}")
+        else:  # stdio
+            cmd = f"{host}:{p}"
+            from .spec import load_spec
+            spec_index = load_spec(Path(spec_file))
+            rep = scan_stdio(cmd, spec_index)
+            table.add_row(f"stdio:{cmd}", str(rep.summary))
     console.print(table)
     if explain and scheme in ("ws", "sse"):
         console.rule("Explanation")

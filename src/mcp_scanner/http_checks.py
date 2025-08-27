@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import httpx
 
@@ -21,9 +21,9 @@ def _finding(spec: SpecCheck, passed: bool, details: str) -> Finding:
     )
 
 
-def scan_http_base(base_url: str, spec_index: Dict[str, SpecCheck]) -> List[Finding]:
+def scan_http_base(base_url: str, spec_index: Dict[str, SpecCheck], headers: Optional[Dict[str, str]] = None) -> List[Finding]:
     findings: List[Finding] = []
-    client = httpx.Client(follow_redirects=True, timeout=5.0)
+    client = httpx.Client(follow_redirects=True, timeout=5.0, headers=headers or {})
 
     # T-02 TLS enforcement & HSTS
     t02 = spec_index.get("T-02")
@@ -41,7 +41,7 @@ def scan_http_base(base_url: str, spec_index: Dict[str, SpecCheck]) -> List[Find
             r_ok = client.get(sse_url)
             exists = r_ok.status_code < 500
             # Now try forged Origin
-            r = client.get(sse_url, headers={"Origin": "http://evil.tld"})
+            r = client.get(sse_url, headers={**({} if headers is None else headers), "Origin": "http://evil.tld"})
             accepts_cross = r.status_code < 400
             passed = exists and not accepts_cross
             details = f"sse={r_ok.status_code}; forged_origin={r.status_code}"
