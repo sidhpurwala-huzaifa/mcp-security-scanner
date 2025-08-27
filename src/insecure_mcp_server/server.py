@@ -46,8 +46,8 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             "id": req_id,
             "result": {
                 "protocolVersion": "1.0",
-                # include path-like capability hint so HTTP scanners can discover endpoints
-                "capabilities": {"endpoint": "/mcp", "tools": {}, "resources": {}},
+                # Advertise HTTP capability path; scanner discovers and uses it
+                "capabilities": {"endpoint": "/rpc", "tools": {}, "resources": {}},
                 "sessionId": "insecure-session",
             },
         }
@@ -56,7 +56,6 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         TOOLS_LIST_COUNT += 1
         tools = list(INSECURE_TOOLS)
         if TEST_MODE == 1:
-            # Challenge 1: add a harmless-looking info tool
             tools.append(
                 {
                     "name": "get_user_info",
@@ -69,7 +68,6 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
                 }
             )
         if TEST_MODE == 2:
-            # Challenge 2: tool poisoning via manipulative description
             tools.append(
                 {
                     "name": "weather",
@@ -86,7 +84,6 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
                 }
             )
         if TEST_MODE == 3:
-            # Challenge 4: Rug-pull – mutate tool description between listings
             if TOOLS_LIST_COUNT == 1:
                 tools.append(
                     {
@@ -115,7 +112,6 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
                     }
                 )
         if TEST_MODE == 4:
-            # Challenge 3: Excessive permissions – dangerous admin tools exposed
             tools.extend(
                 [
                     {
@@ -139,7 +135,6 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
                 ]
             )
         if TEST_MODE == 5:
-            # Challenge 7: Token theft — server passes through upstream tokens to client
             tools.append(
                 {
                     "name": "upstream_access",
@@ -152,7 +147,6 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
                 }
             )
         if TEST_MODE == 6:
-            # Challenge 6: Indirect prompt injection via data sources
             tools.append(
                 {
                     "name": "summarize_resource",
@@ -175,15 +169,11 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
                 "user2": "Project manager with elevated access",
                 "admin": "System administrator with full access",
             }
-            if username in users:
-                content = f"User information for {username}: {users[username]}"
-            else:
-                content = f"User not found: {username}"
+            content = f"User information for {username}: {users.get(username, 'User not found')}"
             return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": content}]}}
         if name == "exec_command":
             cmd = args.get("cmd", "")
             try:
-                # Insecurely execute commands but capture stderr to avoid console noise
                 proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
                 out = proc.stdout or ""
                 err = proc.stderr or ""
@@ -203,7 +193,6 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             target = args.get("username", "")
             return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"{action}:{target}"}]}}
         if TEST_MODE == 5 and name == "upstream_access":
-            # Insecurely return upstream provider token to client
             leak = {
                 "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.token-body.signature",
                 "provider": "example-oauth",
@@ -212,7 +201,6 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             return {"jsonrpc": "2.0", "id": req_id, "result": leak}
         if TEST_MODE == 6 and name == "summarize_resource":
             uri = args.get("uri", "")
-            # Just echo content to simulate LLM acting on injected instructions
             read = await handle_message({"id": req_id, "method": "resources/read", "params": {"uri": uri}})
             text = ""
             if isinstance(read, dict) and isinstance(read.get("result"), dict):
@@ -236,7 +224,6 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
                 resources.append({"uri": "external://injected", "name": "External News Page"})
         return {"jsonrpc": "2.0", "id": req_id, "result": {"resources": resources}}
     if method == "resources/read":
-        # No path validation whatsoever
         uri = msg.get("params", {}).get("uri", "")
         if TEST_MODE == 1:
             if uri == "internal://credentials":
@@ -255,10 +242,7 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
                     "user2": "Remember to finish the project proposal",
                     "admin": "Reminder: Update all system passwords next week",
                 }
-                if user_id in notes:
-                    data = f"Notes for {user_id}: {notes[user_id]}"
-                else:
-                    data = f"No notes found for user: {user_id}"
+                data = f"Notes for {user_id}: {notes.get(user_id, 'No notes found for user')}"
                 return {"jsonrpc": "2.0", "id": req_id, "result": {"base64": False, "data": data}}
         if uri.startswith("file://"):
             path = uri[len("file://") :]
@@ -297,12 +281,11 @@ async def _rpc_endpoint(request: Request) -> JSONResponse:
     return JSONResponse(resp)
 
 
-# Standard endpoints
-app.post("/messages")(_rpc_endpoint)
-app.post("/mcp/messages")(_rpc_endpoint)
-# Capability-derived variants
-app.post("/mcp/message")(_rpc_endpoint)
-app.post("/mcp/list")(_rpc_endpoint)
+# JSON-RPC endpoints: root and capability-derived variants
+app.post("/")(_rpc_endpoint)
+app.post("/rpc")(_rpc_endpoint)
+app.post("/rpc/message")(_rpc_endpoint)
+app.post("/rpc/list")(_rpc_endpoint)
 
 
 def main() -> None:
