@@ -18,7 +18,8 @@ insecure-mcp-server --host 0.0.0.0 --port 8765
 # --test 2: tool poisoning-style vulnerable server
 # --test 3: rug-pull tool mutation between listings
 # --test 4: excessive permissions (admin tools exposed), private:// resource leakage
-insecure-mcp-server --host 127.0.0.1 --port 8770 --test 0/1/2/3/4
+# --test 5: token theft (server leaks upstream access tokens to clients)
+insecure-mcp-server --host 127.0.0.1 --port 8770 --test 0/1/2/3/4/5
 ```
 
 Scan the server
@@ -79,6 +80,7 @@ Capabilities
   - R-03 Sensitive resource exposure (credentials/tokens)
   - R-04 User-controlled resource templates without validation
   - R-05 Private resource exposure (e.g., private://)
+  - A-03 Token pass-through exposure (upstream token leakage)
 
 
 Acknowledgements:

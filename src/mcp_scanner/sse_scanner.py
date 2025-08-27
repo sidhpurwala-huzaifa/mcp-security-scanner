@@ -214,4 +214,12 @@ def run_checks_sse(base_url: str, spec_index: Dict[str, SpecCheck], trace: Optio
                     issues.append({"template": tmpl, "probe": probe, "resp": resp})
         findings.append(_finding(r04, passed=len(issues) == 0, details=json.dumps(issues)))
 
+    # A-03 Token pass-through: call known leaking tool name
+    a03 = spec_index.get("A-03")
+    if a03:
+        leak = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 30, "method": "tools/call", "params": {"name": "upstream_access", "arguments": {"code": "dummy"}}}, trace=trace, verbose=verbose, headers=auth_headers)
+        text = json.dumps(leak).lower()
+        leaked = any(k in text for k in ["access_token", "sk-", "token-body", "bearer "])
+        findings.append(_finding(a03, passed=not leaked, details=json.dumps(leak)))
+
     return findings

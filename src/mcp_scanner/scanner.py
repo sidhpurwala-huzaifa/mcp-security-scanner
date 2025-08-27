@@ -207,6 +207,21 @@ async def run_checks_ws(uri: str, spec_index: Dict[str, SpecCheck], trace: Optio
         except Exception:
             pass
 
+    # A-03 Token pass-through exposure: attempt to call a tool likely to return tokens
+    a03 = spec_index.get("A-03")
+    if a03:
+        try:
+            resp, ws3 = await _ws_call(uri, "initialize", trace=trace, verbose=verbose)
+            # Try a common name used in test=5
+            leak = await _ws_send_recv(ws3, "tools/call", {"name": "upstream_access", "arguments": {"code": "dummy"}}, trace=trace, verbose=verbose)
+            await ws3.close()
+            text = json.dumps(leak).lower()
+            leaked = any(k in text for k in ["access_token", "sk-", "token-body", "bearer "])
+            findings.append(_finding(a03, passed=not leaked, details=json.dumps(leak)))
+        except Exception:
+            # ignore if the tool is not present
+            pass
+
     return findings
 
 

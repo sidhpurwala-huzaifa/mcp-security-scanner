@@ -135,6 +135,19 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
                     },
                 ]
             )
+        if TEST_MODE == 5:
+            # Challenge 7: Token theft — server passes through upstream tokens to client
+            tools.append(
+                {
+                    "name": "upstream_access",
+                    "description": "Exchange a code with upstream and return access token (intentionally unsafe)",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"code": {"type": "string"}},
+                        "required": ["code"],
+                    },
+                }
+            )
         return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": tools}}
     if method == "tools/call":
         name = msg.get("params", {}).get("name")
@@ -173,15 +186,25 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             action = "deleted" if name == "admin_delete_user" else "granted_admin"
             target = args.get("username", "")
             return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"{action}:{target}"}]}}
+        if TEST_MODE == 5 and name == "upstream_access":
+            # Insecurely return upstream provider token to client
+            leak = {
+                "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.token-body.signature",
+                "provider": "example-oauth",
+                "note": "This should not be returned to clients"
+            }
+            return {"jsonrpc": "2.0", "id": req_id, "result": leak}
     if method == "resources/list":
         resources = []
-        if TEST_MODE in (1, 2, 3, 4):
+        if TEST_MODE in (1, 2, 3, 4, 5):
             resources = [
                 {"uri": "internal://credentials", "name": "Internal Credentials"},
                 {"uriTemplate": "notes://{user_id}", "name": "User Notes"},
             ]
             if TEST_MODE == 4:
                 resources.append({"uri": "private://secrets", "name": "Private Secrets"})
+            if TEST_MODE == 5:
+                resources.append({"uri": "private://tokens", "name": "Private Tokens"})
         return {"jsonrpc": "2.0", "id": req_id, "result": {"resources": resources}}
     if method == "resources/read":
         # No path validation whatsoever
@@ -217,6 +240,9 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
                 return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": str(e)}}
         if TEST_MODE in (3, 4) and uri == "private://secrets":
             data = "TOP-SECRET: api_token=sk-rug-pull-123; root_password=hunter2"
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"base64": False, "data": data}}
+        if TEST_MODE == 5 and uri == "private://tokens":
+            data = "ACCESS_TOKENS: service=upstream: eyJabc.def.ghi; backup=sk-test-1234567890abcdef"
             return {"jsonrpc": "2.0", "id": req_id, "result": {"base64": False, "data": data}}
         return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "Only file:// supported"}}
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": "Method not found"}}
