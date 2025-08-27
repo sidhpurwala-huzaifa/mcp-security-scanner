@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 from typing import Any, Dict
 
 import websockets
@@ -97,10 +98,12 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
         if name == "exec_command":
             cmd = args.get("cmd", "")
             try:
-                # Insecurely execute commands and return stdout
-                stream = os.popen(cmd)
-                out = stream.read()
-                return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": out}]}}
+                # Insecurely execute commands but capture stderr to avoid console noise
+                proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                out = proc.stdout or ""
+                err = proc.stderr or ""
+                content_text = out if out else err
+                return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": content_text}]}}
             except Exception as e:  # noqa: BLE001
                 return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": str(e)}}
         if name == "read_file":
@@ -156,7 +159,11 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
 
 async def ws_handler(websocket):
     while True:
-        raw = await websocket.recv()
+        try:
+            raw = await websocket.recv()
+        except Exception:
+            # Client closed or error; exit gracefully
+            break
         try:
             msg = json.loads(raw)
         except Exception:  # noqa: BLE001
