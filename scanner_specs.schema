@@ -325,6 +325,28 @@
     },
 
     {
+      "id": "R-05",
+      "title": "Private resource exposure",
+      "category": "resources",
+      "severity": "high",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "Resources with private:// or similar namespaces readable by clients.",
+      "test": {
+        "type": "mcp",
+        "steps": [
+          "Call resources/list and identify private namespaces (e.g., private://).",
+          "Attempt resources/read and look for secrets/tokens/passwords."
+        ]
+      },
+      "pass_criteria": ["Private namespaces are not client-readable"],
+      "fail_criteria": ["private:// resources are readable"],
+      "remediation": [
+        "Do not expose private resources to clients; enforce RBAC and server-side only access."
+      ],
+      "references": ["Rug-pull and excessive permission challenge patterns"]
+    },
+
+    {
       "id": "X-04",
       "title": "Rate limits & cost controls",
       "category": "tools",

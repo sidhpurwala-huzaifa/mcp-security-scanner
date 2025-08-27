@@ -84,6 +84,24 @@ def run_checks_sse(base_url: str, spec_index: Dict[str, SpecCheck], trace: Optio
         findings.append(_finding(a01, passed=(not bool(tools)), details=json.dumps(tools_list)))
 
     # P-02: Prompt/description injection heuristics
+    # X-03: Rug-pull detection — re-list and diff
+    x03 = spec_index.get("X-03")
+    if x03:
+        tools_list2 = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 20, "method": "tools/list", "params": {}}, trace=trace, verbose=verbose)
+        tools2 = tools_list2.get("result", {}).get("tools", []) if isinstance(tools_list2, dict) else []
+        diff = []
+        def key(t):
+            return t.get("name"), t.get("description")
+        set1 = {key(t) for t in tools}
+        set2 = {key(t) for t in tools2}
+        if set1 != set2:
+            # capture differences
+            diff = [
+                {"before": [t for t in tools if t.get("name") == n and t.get("description") == d],
+                 "after": [t for t in tools2 if t.get("name") == n and t.get("description") == d]}
+                for (n, d) in set1.symmetric_difference(set2)
+            ]
+        findings.append(_finding(x03, passed=len(diff) == 0, details=json.dumps(diff)))
     p02 = spec_index.get("P-02")
     if p02 and tools:
         bad_phrases = [
@@ -153,6 +171,18 @@ def run_checks_sse(base_url: str, spec_index: Dict[str, SpecCheck], trace: Optio
         findings.append(_finding(r03, passed=len(suspects) == 0, details=json.dumps(suspects)))
 
     # R-04 User-controlled templates without validation
+    # R-05 Private resource exposure
+    r05 = spec_index.get("R-05")
+    if r05:
+        leaks = []
+        for r in resources:
+            uri = r.get("uri")
+            if isinstance(uri, str) and uri.startswith("private://"):
+                resp = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 13, "method": "resources/read", "params": {"uri": uri}}, trace=trace, verbose=verbose)
+                text = json.dumps(resp).lower()
+                if any(x in text for x in ["secret", "token", "password"]):
+                    leaks.append({"resource": r, "resp": resp})
+        findings.append(_finding(r05, passed=len(leaks) == 0, details=json.dumps(leaks)))
     r04 = spec_index.get("R-04")
     if r04:
         templates = [r for r in resources if isinstance(r, dict) and r.get("uriTemplate")]

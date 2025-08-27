@@ -12,12 +12,13 @@ Run insecure test server
 insecure-mcp-server --host 0.0.0.0 --port 8765
 
 # Testing the MCP scanner:
-# There are currently 3 test modes which are supported
-# --test 0 or omitting this command line arguement creates your basic insecure MCP server
-# --test 1 creates a server which is vulnerable to prompt injection
-# --test 2 creates a server which is vulnerable to tool poisoning
-# TODO: Add more tests soon
-insecure-mcp-server --host 127.0.0.1 --port 8770 --test 0/1/2
+# Test modes currently supported
+# --test 0 (default): basic insecure MCP server
+# --test 1: prompt injection-style vulnerable server
+# --test 2: tool poisoning-style vulnerable server
+# --test 3: rug-pull tool mutation between listings
+# --test 4: excessive permissions (admin tools exposed), private:// resource leakage
+insecure-mcp-server --host 127.0.0.1 --port 8770 --test 0/1/2/3/4
 ```
 
 Scan the server
@@ -46,9 +47,14 @@ Capabilities
   - A-01 Unauthenticated access
   - X-01 Dangerous tool exposure without constraints
   - P-02 Prompt/description injection heuristics (tool poisoning)
+  - X-03 Tool description stability (rug-pull detection)
   - R-01 Path traversal attempts via resources
   - R-03 Sensitive resource exposure (credentials/tokens)
   - R-04 User-controlled resource templates without validation
+  - R-05 Private resource exposure (e.g., private://)
 
 
+Acknowledgements:
+A lot of attack information have been taken from 
+https://github.com/harishsg993010/damn-vulnerable-MCP-server
 

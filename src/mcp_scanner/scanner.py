@@ -91,6 +91,23 @@ async def run_checks_ws(uri: str, spec_index: Dict[str, SpecCheck], trace: Optio
 
     # X-01: Dangerous capability detection
     # P-02: Prompt/description injection heuristics
+    # X-03: Rug-pull detection — re-list and diff
+    x03 = spec_index.get("X-03")
+    if x03:
+        tools_list2 = await _ws_send_recv(ws, "tools/list", trace=trace, verbose=verbose)
+        tools2 = tools_list2.get("result", {}).get("tools", []) if isinstance(tools_list2, dict) else []
+        diff = []
+        def key(t: Dict[str, Any]):
+            return t.get("name"), t.get("description")
+        set1 = {key(t) for t in tools}
+        set2 = {key(t) for t in tools2}
+        if set1 != set2:
+            diff = [
+                {"before": [t for t in tools if t.get("name") == n and t.get("description") == d],
+                 "after": [t for t in tools2 if t.get("name") == n and t.get("description") == d]}
+                for (n, d) in set1.symmetric_difference(set2)
+            ]
+        findings.append(_finding(x03, passed=len(diff) == 0, details=json.dumps(diff)))
     p02 = spec_index.get("P-02")
     if p02 and tools:
         bad_phrases = [
