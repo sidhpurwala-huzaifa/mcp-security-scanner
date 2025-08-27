@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 import click
+import httpx
 from rich.console import Console
 from rich.table import Table
 
@@ -58,7 +59,22 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, transport: str, verbose: b
         if auth_headers:
             # monkey patch: inject into base URL via header registry in trace for sse_scanner
             trace.append({"transport": "sse", "auth_headers": auth_headers})
-        findings = run_checks_sse(url, spec_index, trace=trace, verbose=verbose)
+        # Preflight: verify SSE endpoint returns event-stream; otherwise fall back to HTTP checks
+        sse_url = url.rstrip("/") + "/sse"
+        fallback_http = False
+        try:
+            with httpx.Client(follow_redirects=True, timeout=5.0, headers=auth_headers or {}) as client:
+                r = client.get(sse_url)
+                ctype = r.headers.get("content-type", "")
+                if "text/event-stream" not in ctype.lower():
+                    fallback_http = True
+        except Exception:
+            fallback_http = True
+
+        if fallback_http:
+            findings = scan_http_base(url, spec_index, headers=auth_headers)
+        else:
+            findings = run_checks_sse(url, spec_index, trace=trace, verbose=verbose, auth_headers=auth_headers if auth_headers else None)
         report = Report.new(target=url, findings=findings)
     else:  # stdio
         from .spec import load_spec
@@ -135,7 +151,17 @@ def scan_range_cmd(host: str, ports: str, scheme: str, spec: Optional[str], verb
             table.add_row(base, f"passed={passed} failed={failed}")
         elif scheme == "sse":
             base = f"http://{host}:{p}"
-            findings = run_checks_sse(base, spec_index, trace=trace, verbose=verbose)
+            # Preflight SSE; if not event-stream, do HTTP transport checks
+            sse_url = base.rstrip("/") + "/sse"
+            use_http = False
+            try:
+                with httpx.Client(follow_redirects=True, timeout=3.0) as client:
+                    r = client.get(sse_url)
+                    if "text/event-stream" not in r.headers.get("content-type", "").lower():
+                        use_http = True
+            except Exception:
+                use_http = True
+            findings = scan_http_base(base, spec_index) if use_http else run_checks_sse(base, spec_index, trace=trace, verbose=verbose)
             passed = sum(1 for f in findings if f.passed)
             failed = sum(1 for f in findings if not f.passed)
             table.add_row(base + "/sse", f"passed={passed} failed={failed}")
