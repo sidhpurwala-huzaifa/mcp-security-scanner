@@ -93,20 +93,34 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         if a01:
             try:
                 unauth = httpx.Client(follow_redirects=True, timeout=6.0)
-                msg_url = base_url.rstrip("/") + "/messages"
                 payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
-                if verbose and trace is not None:
-                    trace.append({"transport": "http", "direction": "send", "request": payload, "url": msg_url})
-                r = unauth.post(msg_url, json=payload)
-                status = r.status_code
-                is_denied = status in (401, 403)
-                if verbose and trace is not None:
+                # Try minimal default candidates; capabilities refine later
+                candidates = [
+                    base_url.rstrip("/") + "/messages",
+                    base_url.rstrip("/") + "/messages/",
+                ]
+                status = None
+                body_text = ""
+                for msg_url in candidates:
+                    if verbose and trace is not None:
+                        trace.append({"transport": "http", "direction": "send", "request": payload, "url": msg_url})
+                    r = unauth.post(msg_url, json=payload)
+                    status = r.status_code
                     try:
-                        body = r.json()
+                        body_text = r.text
                     except Exception:
-                        body = r.text
-                    trace.append({"transport": "http", "direction": "recv", "status": status, "data": body})
-                details = f"status={status}, body={(r.text[:200] + '...') if len(r.text)>200 else r.text}"
+                        body_text = ""
+                    if verbose and trace is not None:
+                        try:
+                            body = r.json()
+                        except Exception:
+                            body = r.text
+                        trace.append({"transport": "http", "direction": "recv", "status": status, "data": body})
+                    # Accept first non-404 as authoritative
+                    if status != 404:
+                        break
+                is_denied = (status in (401, 403)) if status is not None else False
+                details = f"status={status}, body={(body_text[:200] + '...') if len(body_text)>200 else body_text}"
                 findings.append(_finding(a01, passed=is_denied, details=details))
             except Exception as e:
                 findings.append(_finding(a01, passed=False, details=f"error={type(e).__name__}:{e}"))
@@ -133,55 +147,140 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         t03 = spec_index.get("T-03")
         if t03:
             try:
-                msg_url = base_url.rstrip("/") + "/messages"
                 init_payload = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
-                if verbose and trace is not None:
-                    trace.append({"transport": "http", "direction": "send", "request": init_payload, "url": msg_url})
-                init = client.post(msg_url, json=init_payload)
-                sess = init.headers.get("Mcp-Session-Id") or init.cookies.get("mcp_session")
-                ok = bool(sess)
-                # Try an altered session id
-                bad_headers = dict(client.headers)
-                if sess and "Mcp-Session-Id" not in bad_headers:
-                    bad_headers["Mcp-Session-Id"] = sess + "-x"
-                bad_payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
-                if verbose and trace is not None:
-                    trace.append({"transport": "http", "direction": "send", "request": bad_payload, "url": msg_url, "note": "altered session id"})
-                bad = httpx.post(msg_url, json=bad_payload, headers=bad_headers, timeout=6.0)
-                rejects_bad = bad.status_code in (401, 403, 400)
-                if verbose and trace is not None:
+                candidates = [
+                    base_url.rstrip("/") + "/messages",
+                    base_url.rstrip("/") + "/messages/",
+                ]
+                sess = None
+                last_status = None
+                chosen_url = None
+                init_json: Optional[Dict[str, Any]] = None
+                for msg_url in candidates:
+                    if verbose and trace is not None:
+                        trace.append({"transport": "http", "direction": "send", "request": init_payload, "url": msg_url})
+                    init = client.post(msg_url, json=init_payload)
+                    last_status = init.status_code
+                    sess = init.headers.get("Mcp-Session-Id") or init.cookies.get("mcp_session")
                     try:
-                        bad_body = bad.json()
+                        init_json = init.json()
                     except Exception:
-                        bad_body = bad.text
-                    trace.append({"transport": "http", "direction": "recv", "status": bad.status_code, "data": bad_body})
-                findings.append(_finding(t03, passed=(ok and rejects_bad), details=f"session_present={bool(sess)}, bad_status={bad.status_code}"))
+                        init_json = None
+                    if sess or (last_status and last_status != 404) or (init_json and isinstance(init_json, dict) and init_json.get("result")):
+                        chosen_url = msg_url
+                        break
+                ok = bool(sess)
+                # Try an altered session id if we have a chosen URL
+                if chosen_url and sess:
+                    bad_headers = dict(client.headers)
+                    if "Mcp-Session-Id" not in bad_headers:
+                        bad_headers["Mcp-Session-Id"] = sess + "-x"
+                    bad_payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+                    if verbose and trace is not None:
+                        trace.append({"transport": "http", "direction": "send", "request": bad_payload, "url": chosen_url, "note": "altered session id"})
+                    bad = httpx.post(chosen_url, json=bad_payload, headers=bad_headers, timeout=6.0)
+                    rejects_bad = bad.status_code in (401, 403, 400)
+                    if verbose and trace is not None:
+                        try:
+                            bad_body = bad.json()
+                        except Exception:
+                            bad_body = bad.text
+                        trace.append({"transport": "http", "direction": "recv", "status": bad.status_code, "data": bad_body})
+                else:
+                    rejects_bad = False
+                findings.append(_finding(t03, passed=(ok and rejects_bad), details=f"session_present={bool(sess)}, status={last_status}"))
+                # Expose chosen URL and init_json to capability extraction below via closures
+                discovered_url = chosen_url
+                discovered_init = init_json
             except Exception as e:
+                discovered_url = None
+                discovered_init = None
                 findings.append(_finding(t03, passed=False, details=f"error={type(e).__name__}:{e}"))
 
-        # JSON-RPC helper over messages
+        # JSON-RPC helper over messages with endpoint discovery
+        msg_url_cache: Optional[str] = None
+        if 'discovered_url' in locals() and discovered_url:
+            msg_url_cache = discovered_url
+
         def rpc(method: str, params: Dict[str, object]) -> Dict[str, object]:
-            msg_url = base_url.rstrip("/") + "/messages"
+            nonlocal msg_url_cache
+            candidates = [
+                base_url.rstrip("/") + "/messages",
+                base_url.rstrip("/") + "/messages/",
+            ]
+            if msg_url_cache:
+                candidates = [msg_url_cache]
+            last_error: Optional[Dict[str, Any]] = None
             payload = {"jsonrpc": "2.0", "id": 99, "method": method, "params": params}
-            if verbose and trace is not None:
-                trace.append({"transport": "http", "direction": "send", "request": payload, "url": msg_url})
-            r = client.post(msg_url, json=payload)
-            try:
-                data = r.json()
-                if verbose and trace is not None:
-                    trace.append({"transport": "http", "direction": "recv", "status": r.status_code, "data": data})
-                return data
-            except Exception:
-                if verbose and trace is not None:
-                    trace.append({"transport": "http", "direction": "recv", "status": r.status_code, "raw": r.text})
-                return {"status": r.status_code, "body": r.text}
+            for msg_url in candidates:
+                try:
+                    if verbose and trace is not None:
+                        trace.append({"transport": "http", "direction": "send", "request": payload, "url": msg_url})
+                    r = client.post(msg_url, json=payload)
+                    try:
+                        data = r.json()
+                        if verbose and trace is not None:
+                            trace.append({"transport": "http", "direction": "recv", "status": r.status_code, "data": data})
+                        if isinstance(data, dict):
+                            msg_url_cache = msg_url
+                        return data
+                    except Exception:
+                        if verbose and trace is not None:
+                            trace.append({"transport": "http", "direction": "recv", "status": r.status_code, "raw": r.text})
+                        last_error = {"status": r.status_code, "body": r.text}
+                        # try next candidate
+                except Exception as e:
+                    last_error = {"error": f"{type(e).__name__}:{e}"}
+                    continue
+            return last_error or {"error": "no-endpoint"}
 
         # BASE-01: initialize
         base = spec_index.get("BASE-01")
+        init = {}
         if base:
             init = rpc("initialize", {"capabilities": {}, "clientInfo": {"name": "mcp-security-scanner", "version": "0.1.0"}})
             ok = isinstance(init, dict) and "result" in init and "capabilities" in init.get("result", {})
             findings.append(_finding(base, ok, json.dumps(init)))
+
+        # If initialize returned capability paths, try to refine msg_url_cache
+        try:
+            caps = (init.get("result", {}) if isinstance(init, dict) else {}).get("capabilities", {})
+            paths: List[str] = []
+            def _collect_paths(obj: Any) -> None:
+                if isinstance(obj, dict):
+                    for v in obj.values():
+                        _collect_paths(v)
+                elif isinstance(obj, list):
+                    for v in obj:
+                        _collect_paths(v)
+                elif isinstance(obj, str) and obj.startswith("/"):
+                    paths.append(obj)
+            _collect_paths(caps)
+            for p in paths:
+                base_p = base_url.rstrip("/") + p
+                probe_candidates = [
+                    base_p,
+                    base_p.rstrip("/") + "/message",
+                    base_p.rstrip("/") + "/list",
+                ]
+                for u in probe_candidates:
+                    payload = {"jsonrpc": "2.0", "id": 42, "method": "tools/list", "params": {}}
+                    if verbose and trace is not None:
+                        trace.append({"transport": "http", "direction": "send", "request": payload, "url": u, "note": "capability path probe"})
+                    resp = client.post(u, json=payload)
+                    if resp.status_code != 404:
+                        try:
+                            _ = resp.json()
+                            msg_url_cache = u
+                            if verbose and trace is not None:
+                                trace.append({"transport": "http", "direction": "recv", "status": resp.status_code, "note": "selected capability path"})
+                            raise StopIteration  # break both loops
+                        except Exception:
+                            continue
+        except StopIteration:
+            pass
+        except Exception:
+            pass
 
         # tools/list
         tools_list: Dict[str, Any] = rpc("tools/list", {})
@@ -200,7 +299,7 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
             if set1 != set2:
                 diff = [
                     {"before": [t for t in tools if t.get("name") == n and t.get("description") == d],
-                     "after": [t for t in tools2 if t.get("name") == n and t.get("description") == d]}
+                    "after": [t for t in tools2 if t.get("name") == n and t.get("description") == d]}
                     for (n, d) in set1.symmetric_difference(set2)
                 ]
             findings.append(_finding(x03, passed=len(diff) == 0, details=json.dumps(diff)))
@@ -305,7 +404,7 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         # X-02: Injection fuzzing on string params
         x02 = spec_index.get("X-02")
         if x02 and isinstance(tools, list):
-            payloads = ["; id", "$(whoami)", "`uname -a`", "../../../../etc/passwd", "http://169.254.169.254/latest/meta-data/"]
+            payloads = ["; id", "$(whoami)", "`uname - a`", "../../../../etc/passwd", "http://169.254.169.254/latest/meta-data/"]
             observed: List[Dict[str, Any]] = []
             for t in tools:
                 name = t.get("name")

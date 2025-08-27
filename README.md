@@ -1,4 +1,4 @@
-MCP Security Scanner
+MCP Security Scanner (HTTP-only)
 
 Install
 ```bash
@@ -6,61 +6,52 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
 
-Run insecure test server
+Run insecure test server (HTTP)
 ```bash
-# Basic
-insecure-mcp-server --host 0.0.0.0 --port 8765
+# Basic (HTTP JSON-RPC). Supports --test modes (see below)
+insecure-mcp-server --host 127.0.0.1 --port 9001
 
-# Testing the MCP scanner:
 # Test modes currently supported
-# --test 0 (default): basic insecure MCP server
+# --test 0 (default): basic insecure MCP-like server
 # --test 1: prompt injection-style vulnerable server
 # --test 2: tool poisoning-style vulnerable server
 # --test 3: rug-pull tool mutation between listings
 # --test 4: excessive permissions (admin tools exposed), private:// resource leakage
 # --test 5: token theft (server leaks upstream access tokens to clients)
 # --test 6: indirect prompt injection (external resource carries hidden instructions)
-insecure-mcp-server --host 127.0.0.1 --port 8770 --test 0/1/2/3/4/5
+insecure-mcp-server --host 127.0.0.1 --port 9001 --test 0/1/2/3/4/5/6
 ```
 
-Scan the server
+Scan the server (HTTP only)
 ```bash
-mcp-scan scan --url ws://127.0.0.1:8765 --format text
-mcp-scan scan --url ws://127.0.0.1:8765 --format json --output report.json
+# Text report
+mcp-scan scan --url http://127.0.0.1:9001 --format text
 
-# SSE transport (against SSE-capable servers)
-mcp-scan scan --url http://localhost:9001 --transport sse --format text
-
-# stdio transport (MCP over stdin/stdout)
-# Pass the stdio command in --url
-mcp-scan scan --transport stdio --url "python path/to/your_stdio_mcp.py" --format text
+# JSON report
+mcp-scan scan --url http://127.0.0.1:9001 --format json --output report.json
 
 # Verbose tracing (prints requests/responses and leaked data)
-mcp-scan scan --url ws://127.0.0.1:8770 --format text --verbose
+mcp-scan scan --url http://127.0.0.1:9001 --verbose
 
 # Plain-English explanations (no full packet dump)
-mcp-scan scan --url ws://127.0.0.1:8770 --format text --explain
+mcp-scan scan --url http://127.0.0.1:9001 --explain
 
 # Scan a range of targets
 mcp-scan scan-range --host localhost --ports 9001-9010 --scheme http
-mcp-scan scan-range --host localhost --ports 9001-9010 --scheme sse --verbose
 ```
 
-
-Authenticated MCP servers
+Authentication (HTTP)
 ```bash
-# Bearer token (SSE transport)
+# Bearer token
 mcp-scan scan \
   --url http://your-mcp.example.com \
-  --transport sse \
   --auth-type bearer \
   --auth-token "$TOKEN" \
   --explain
 
-# OAuth2 Client Credentials (SSE transport)
+# OAuth2 Client Credentials
 mcp-scan scan \
   --url http://your-mcp.example.com \
-  --transport sse \
   --auth-type oauth2-client-credentials \
   --token-url https://issuer.example.com/oauth2/token \
   --client-id "$CLIENT_ID" --client-secret "$CLIENT_SECRET" \
@@ -68,14 +59,19 @@ mcp-scan scan \
   --explain
 ```
 
+How endpoint discovery works
+- The scanner starts with default candidates: `/messages` and `/messages/`.
+- It calls `initialize` and extracts any capability strings that look like paths (beginning with `/`).
+- It probes those capability-derived paths as JSON-RPC endpoints, trying `{capability}`, `{capability}/message`, and `{capability}/list`.
+- The first endpoint that returns a valid JSON-RPC response is cached and then used for all subsequent calls (tools/prompts/resources).
+- `--verbose` shows each attempted URL and the final selected endpoint.
 
-Capabilities
-- Transports: WebSocket (ws/wss), SSE (http/https + /sse), and stdio
+Capabilities (checks)
 - Multi-target scanning: port ranges via scan-range
 - Verbose mode: full request/response trace and leakage evidence
 - Explain mode: plain-English what-was-sent/received/expected and exploited capability
-- Authenticated scans (SSE): bearer token or OAuth2 client-credentials
-- Findings mapped to scanner_specs.schema (examples):
+- Authenticated scans: bearer token or OAuth2 client-credentials
+- Findings mapped to `scanner_specs.schema` (examples):
   - T-02 TLS enforcement & HSTS
   - A-01 Unauthenticated access
   - X-01 Dangerous tool exposure without constraints
@@ -88,8 +84,10 @@ Capabilities
   - A-03 Token pass-through exposure (upstream token leakage)
   - P-03 Indirect prompt injection via external resources
 
+Notes
+- Transports removed: WebSocket and SSE are no longer supported; the scanner is HTTP-only.
+- The insecure server is now HTTP (FastAPI + uvicorn) and exposes JSON-RPC endpoints used by the scanner.
 
-Acknowledgements:
-A lot of attack information have been taken from 
-https://github.com/harishsg993010/damn-vulnerable-MCP-server
+Acknowledgements
+- Vulnerability ideas inspired by `Damn Vulnerable MCP Server` (`https://github.com/harishsg993010/damn-vulnerable-MCP-server`).
 

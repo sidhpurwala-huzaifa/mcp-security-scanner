@@ -5,16 +5,12 @@ from pathlib import Path
 from typing import Optional
 
 import click
-import httpx
 from rich.console import Console
 from rich.table import Table
 
 from .models import Report
-from .scanner import scan_server
 from .spec import load_spec
-from .http_checks import scan_http_base, run_full_http_checks
-from .sse_scanner import run_checks_sse
-from .stdio_scanner import scan_stdio
+from .http_checks import run_full_http_checks, scan_http_base
 from .auth import build_auth_headers
 
 
@@ -23,14 +19,13 @@ console = Console()
 
 @click.group()
 def main() -> None:
-    """MCP Security Scanner CLI."""
+    """MCP Security Scanner CLI (HTTP-only)."""
 
 
 @main.command("scan")
-@click.option("--url", required=True, help="Target MCP server websocket URL (ws:// or wss://)")
+@click.option("--url", required=True, help="Target MCP server base URL (http:// or https://)")
 @click.option("--spec", type=click.Path(exists=True, dir_okay=False), help="Path to scanner_specs.schema")
 @click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
-@click.option("--transport", type=click.Choice(["ws", "sse"]), default="ws")
 @click.option("--verbose", is_flag=True, default=False, help="Print full request/response trace and leaked data")
 @click.option("--explain", is_flag=True, default=False, help="Plain-English summary of sent/received/expected and exploited capability")
 @click.option("--auth-type", type=click.Choice(["bearer", "oauth2-client-credentials"]))
@@ -40,48 +35,19 @@ def main() -> None:
 @click.option("--client-secret")
 @click.option("--scope")
 @click.option("--output", type=click.Path(dir_okay=False), help="Write report to file")
-def scan_cmd(url: str, spec: Optional[str], fmt: str, transport: str, verbose: bool, explain: bool, auth_type: Optional[str], auth_token: Optional[str], token_url: Optional[str], client_id: Optional[str], client_secret: Optional[str], scope: Optional[str], output: Optional[str]) -> None:
+def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain: bool, auth_type: Optional[str], auth_token: Optional[str], token_url: Optional[str], client_id: Optional[str], client_secret: Optional[str], scope: Optional[str], output: Optional[str]) -> None:
     if verbose and explain:
         console.print("--verbose and --explain are mutually exclusive; using --explain.")
         verbose = False
     trace: list[dict] = [] if (verbose or explain) else []
     auth_headers = build_auth_headers(auth_type, auth_token, token_url, client_id, client_secret, scope)
-    if transport == "ws":
-        report: Report = scan_server(url, spec_path=spec, verbose=verbose, trace=trace)  # TODO: ws headers
-    elif transport == "sse":
-        from .spec import load_spec
-        from .models import Report
-        from pathlib import Path
 
-        spec_file = Path(spec) if spec else Path(__file__).resolve().parents[2] / "scanner_specs.schema"
-        spec_index = load_spec(spec_file)
-        # Pass Authorization header for SSE
-        if auth_headers:
-            # monkey patch: inject into base URL via header registry in trace for sse_scanner
-            trace.append({"transport": "sse", "auth_headers": auth_headers})
-        # Preflight: verify SSE endpoint returns event-stream; otherwise fall back to HTTP checks
-        sse_url = url.rstrip("/") + "/sse"
-        fallback_http = False
-        try:
-            with httpx.Client(follow_redirects=True, timeout=5.0, headers=auth_headers or {}) as client:
-                r = client.get(sse_url)
-                ctype = r.headers.get("content-type", "")
-                if "text/event-stream" not in ctype.lower():
-                    fallback_http = True
-        except Exception:
-            fallback_http = True
+    spec_file = Path(spec) if spec else Path(__file__).resolve().parents[2] / "scanner_specs.schema"
+    spec_index = load_spec(spec_file)
 
-        if fallback_http:
-            findings = run_full_http_checks(url, spec_index, headers=auth_headers, trace=trace, verbose=verbose)
-        else:
-            findings = run_checks_sse(url, spec_index, trace=trace, verbose=verbose, auth_headers=auth_headers if auth_headers else None)
-        report = Report.new(target=url, findings=findings)
-    else:  # stdio
-        from .spec import load_spec
-        from pathlib import Path
-        spec_file = Path(spec) if spec else Path(__file__).resolve().parents[2] / "scanner_specs.schema"
-        spec_index = load_spec(spec_file)
-        report = scan_stdio(url, spec_index)
+    findings = run_full_http_checks(url, spec_index, headers=auth_headers, trace=trace, verbose=verbose)
+    report = Report.new(target=url, findings=findings)
+
     if fmt == "json":
         data = report.model_dump()
         out = json.dumps(data, indent=2)
@@ -114,15 +80,13 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, transport: str, verbose: b
 @main.command("scan-range")
 @click.option("--host", required=True, help="Target host, e.g., localhost")
 @click.option("--ports", required=True, help="Comma or dash separated ports, e.g., 9001-9010 or 8765,9001")
-@click.option("--scheme", type=click.Choice(["ws", "wss", "http", "https", "sse"]), default="http")
+@click.option("--scheme", type=click.Choice(["http", "https"]), default="http")
 @click.option("--spec", type=click.Path(exists=True, dir_okay=False), help="Path to scanner_specs.schema")
 @click.option("--verbose", is_flag=True, default=False, help="Print full request/response trace and leaked data")
 @click.option("--explain", is_flag=True, default=False, help="Plain-English summary of sent/received/expected and exploited capability")
 def scan_range_cmd(host: str, ports: str, scheme: str, spec: Optional[str], verbose: bool, explain: bool) -> None:
     spec_file = spec
     if spec_file is None:
-        from pathlib import Path
-
         spec_file = str(Path(__file__).resolve().parents[2] / "scanner_specs.schema")
     spec_index = load_spec(Path(spec_file))
     ports_list: list[int] = []
@@ -138,41 +102,13 @@ def scan_range_cmd(host: str, ports: str, scheme: str, spec: Optional[str], verb
     table.add_column("Findings summary")
     for p in ports_list:
         trace: list[dict] = [] if (verbose or explain) else []
-        if scheme in ("ws", "wss"):
-            target = f"{scheme}://{host}:{p}"
-            report = scan_server(target, spec_path=spec_file, verbose=verbose, trace=trace)
-            table.add_row(target, str(report.summary))
-        elif scheme in ("http", "https"):
-            base = f"{scheme}://{host}:{p}"
-            findings = scan_http_base(base, spec_index)
-            # Build a mini summary
-            passed = sum(1 for f in findings if f.passed)
-            failed = sum(1 for f in findings if not f.passed)
-            table.add_row(base, f"passed={passed} failed={failed}")
-        elif scheme == "sse":
-            base = f"http://{host}:{p}"
-            # Preflight SSE; if not event-stream, do HTTP transport checks
-            sse_url = base.rstrip("/") + "/sse"
-            use_http = False
-            try:
-                with httpx.Client(follow_redirects=True, timeout=3.0) as client:
-                    r = client.get(sse_url)
-                    if "text/event-stream" not in r.headers.get("content-type", "").lower():
-                        use_http = True
-            except Exception:
-                use_http = True
-            findings = (run_full_http_checks(base, spec_index) if use_http else run_checks_sse(base, spec_index, trace=trace, verbose=verbose))
-            passed = sum(1 for f in findings if f.passed)
-            failed = sum(1 for f in findings if not f.passed)
-            table.add_row(base + "/sse", f"passed={passed} failed={failed}")
-        else:  # stdio
-            cmd = f"{host}:{p}"
-            from .spec import load_spec
-            spec_index = load_spec(Path(spec_file))
-            rep = scan_stdio(cmd, spec_index)
-            table.add_row(f"stdio:{cmd}", str(rep.summary))
+        base = f"{scheme}://{host}:{p}"
+        findings = run_full_http_checks(base, spec_index, trace=trace, verbose=verbose)
+        passed = sum(1 for f in findings if f.passed)
+        failed = sum(1 for f in findings if not f.passed)
+        table.add_row(base, f"passed={passed} failed={failed}")
     console.print(table)
-    if explain and scheme in ("ws", "sse"):
+    if explain:
         console.rule("Explanation")
         console.print("Re-run single-target scan with --explain for detailed narrative.")
 

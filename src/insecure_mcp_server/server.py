@@ -6,7 +6,9 @@ import os
 import subprocess
 from typing import Any, Dict
 
-import websockets
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+import uvicorn
 
 
 INSECURE_TOOLS = [
@@ -44,7 +46,8 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             "id": req_id,
             "result": {
                 "protocolVersion": "1.0",
-                "capabilities": {"tools": {}, "resources": {}},
+                # include path-like capability hint so HTTP scanners can discover endpoints
+                "capabilities": {"endpoint": "/mcp", "tools": {}, "resources": {}},
                 "sessionId": "insecure-session",
             },
         }
@@ -282,40 +285,39 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": "Method not found"}}
 
 
-async def ws_handler(websocket):
-    while True:
-        try:
-            raw = await websocket.recv()
-        except Exception:
-            # Client closed or error; exit gracefully
-            break
-        try:
-            msg = json.loads(raw)
-        except Exception:  # noqa: BLE001
-            await websocket.send(json.dumps({"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}}))
-            continue
-        resp = await handle_message(msg)
-        await websocket.send(json.dumps(resp))
+app = FastAPI()
+
+
+async def _rpc_endpoint(request: Request) -> JSONResponse:
+    try:
+        msg = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}}, status_code=400)
+    resp = await handle_message(msg if isinstance(msg, dict) else {})
+    return JSONResponse(resp)
+
+
+# Standard endpoints
+app.post("/messages")(_rpc_endpoint)
+app.post("/mcp/messages")(_rpc_endpoint)
+# Capability-derived variants
+app.post("/mcp/message")(_rpc_endpoint)
+app.post("/mcp/list")(_rpc_endpoint)
 
 
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Insecure MCP-like WebSocket server", add_help=False)
-    parser.add_argument("--host", default="0.0.0.0")  # insecure bind by default
-    parser.add_argument("--port", type=int, default=8765)
+    parser = argparse.ArgumentParser(description="Insecure MCP-like HTTP server", add_help=False)
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=9001)
     parser.add_argument("--test", type=int, default=0, help="Enable test scenario (e.g., 1 for challenge1-like)")
     args, _unknown = parser.parse_known_args()
 
     global TEST_MODE
     TEST_MODE = int(args.test)
 
-    async def _run() -> None:
-        async with websockets.serve(ws_handler, args.host, args.port):
-            print(f"Insecure MCP server listening on ws://{args.host}:{args.port} (test={TEST_MODE})")
-            await asyncio.Future()
-
-    asyncio.run(_run())
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":
