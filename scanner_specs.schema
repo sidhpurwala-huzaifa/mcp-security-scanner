@@ -1,0 +1,568 @@
+```json
+{
+  "schema_version": "1.0.0",
+  "name": "mcp-server-security-checklist",
+  "description": "Programmatic checklist to scan and harden Model Context Protocol (MCP) servers.",
+  "checks": [
+    {
+      "id": "BASE-01",
+      "title": "Fingerprint server capabilities",
+      "category": "baseline",
+      "severity": "info",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "Identify protocol/transport, version, and declared capabilities.",
+      "test": {
+        "type": "mcp",
+        "steps": [
+          "Send `initialize` and record `protocolVersion`, `capabilities`, and any `sessionId`.",
+          "Call `tools/list`, `resources/list`, `prompts/list`, and optionally `roots/list` or `sampling/*` if advertised.",
+          "Verify later responses are consistent with declared capabilities."
+        ]
+      },
+      "pass_criteria": [
+        "Initialize succeeds with coherent `capabilities`.",
+        "Optional features only respond if advertised."
+      ],
+      "fail_criteria": [
+        "Inconsistent capability reporting (e.g., missing methods that were advertised)."
+      ],
+      "remediation": [
+        "Align capability advertisement with implemented features.",
+        "Return explicit errors for unsupported calls."
+      ],
+      "references": ["MCP Spec: Initialize & Capabilities"]
+    },
+
+    {
+      "id": "T-01",
+      "title": "Origin validation & local bind (DNS-rebind resistance)",
+      "category": "transport",
+      "severity": "high",
+      "applies_to": ["remote-http", "local-http"],
+      "detect": "Server accepts requests from untrusted web origins or bound to 0.0.0.0 locally.",
+      "test": {
+        "type": "http",
+        "steps": [
+          "For HTTP servers, send a valid MCP request with a forged `Origin` header (e.g., http://evil.tld).",
+          "Repeat with an allowed/same-origin value.",
+          "For local servers, probe listening interfaces to see if bound to 0.0.0.0."
+        ]
+      },
+      "pass_criteria": [
+        "Rejects unexpected `Origin` values with 4xx.",
+        "Local servers bind to 127.0.0.1/::1 only."
+      ],
+      "fail_criteria": [
+        "Accepts cross-origin requests without validation.",
+        "Local server exposed on 0.0.0.0."
+      ],
+      "remediation": [
+        "Enforce strict Origin checking for Streamable HTTP.",
+        "Bind local servers to loopback only."
+      ],
+      "references": ["MCP Streamable HTTP: Origin guidance"]
+    },
+
+    {
+      "id": "T-02",
+      "title": "TLS enforcement & HSTS",
+      "category": "transport",
+      "severity": "high",
+      "applies_to": ["remote-http"],
+      "detect": "Plain HTTP endpoints or weak TLS posture.",
+      "test": {
+        "type": "http",
+        "steps": [
+          "Attempt HTTP; expect redirect or refusal.",
+          "Validate certificate chain and hostname.",
+          "Check HSTS header presence."
+        ]
+      },
+      "pass_criteria": ["HTTPS only; valid cert; HSTS enabled"],
+      "fail_criteria": ["HTTP allowed; invalid/expired cert; missing HSTS"],
+      "remediation": [
+        "Terminate TLS at gateway; force HTTPS redirects.",
+        "Enable HSTS; rotate valid certs."
+      ],
+      "references": ["General API TLS hardening best practices"]
+    },
+
+    {
+      "id": "T-03",
+      "title": "Session identifier handling",
+      "category": "transport",
+      "severity": "medium",
+      "applies_to": ["remote-http"],
+      "detect": "Missing or weak session continuity for Streamable HTTP.",
+      "test": {
+        "type": "http",
+        "steps": [
+          "Record `Mcp-Session-Id` (if returned) after `initialize`.",
+          "Re-use, omit, and alter session IDs in subsequent calls.",
+          "Verify expired/unknown sessions are rejected."
+        ]
+      },
+      "pass_criteria": ["Session IDs required, validated, and expire correctly"],
+      "fail_criteria": ["No session continuity; accepts unknown/expired IDs"],
+      "remediation": [
+        "Issue unguessable, short-lived session IDs.",
+        "Validate session binding on every request."
+      ],
+      "references": ["MCP Streamable HTTP sessions"]
+    },
+
+    {
+      "id": "A-01",
+      "title": "Authentication required for remote servers",
+      "category": "authz",
+      "severity": "critical",
+      "applies_to": ["remote-http"],
+      "detect": "Unauthenticated access to server methods.",
+      "test": {
+        "type": "http",
+        "steps": [
+          "Call `initialize` and `tools/list` without `Authorization`.",
+          "Expect 401 with `WWW-Authenticate` or OAuth2 flow requirement."
+        ]
+      },
+      "pass_criteria": ["Unauthenticated requests are rejected"],
+      "fail_criteria": ["Server serves methods without authentication"],
+      "remediation": [
+        "Enforce OAuth 2.1/OIDC with PKCE; deny anonymous access."
+      ],
+      "references": ["MCP Authorization: OAuth 2.1"]
+    },
+
+    {
+      "id": "A-02",
+      "title": "OAuth metadata & token audience/PKCE",
+      "category": "authz",
+      "severity": "high",
+      "applies_to": ["remote-http"],
+      "detect": "Misconfigured OAuth server or tokens not bound to audience/PKCE.",
+      "test": {
+        "type": "http",
+        "steps": [
+          "Discover `/.well-known/oauth-authorization-server`.",
+          "Verify authz, token, and registration endpoints.",
+          "Check access tokens contain proper `aud` and are short-lived.",
+          "Verify PKCE is required for public clients."
+        ]
+      },
+      "pass_criteria": [
+        "Well-known metadata present; PKCE enforced; tokens scoped & audienced"
+      ],
+      "fail_criteria": ["Missing discovery or weak token properties"],
+      "remediation": [
+        "Enable PKCE; issue short-lived, audience-bound tokens.",
+        "Document scopes per tool."
+      ],
+      "references": ["OAuth 2.1 / OIDC discovery"]
+    },
+
+    {
+      "id": "A-03",
+      "title": "Token indirection (no upstream token pass-through)",
+      "category": "authz",
+      "severity": "critical",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "Server returns upstream provider tokens to clients.",
+      "test": {
+        "type": "mcp",
+        "steps": [
+          "Initiate a flow where server accesses an upstream API on user’s behalf.",
+          "Inspect what credential the server exposes back to client."
+        ]
+      },
+      "pass_criteria": [
+        "Client receives only server-issued, minimized token; upstream tokens stored server-side"
+      ],
+      "fail_criteria": ["Client obtains upstream provider token directly"],
+      "remediation": [
+        "Adopt token indirection: never pass through upstream tokens to clients."
+      ],
+      "references": ["MCP Auth best practices: avoid confused deputy"]
+    },
+
+    {
+      "id": "A-04",
+      "title": "Per-tool RBAC & scoped authorization",
+      "category": "authz",
+      "severity": "high",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "Server applies coarse, server-wide permissions only.",
+      "test": {
+        "type": "mcp",
+        "steps": [
+          "Attempt invoking each tool with missing/insufficient scopes/claims.",
+          "Expect denial for unauthorized tools/resources."
+        ]
+      },
+      "pass_criteria": ["Per-tool/resource authorization enforced"],
+      "fail_criteria": ["All tools usable with broad/global permission"],
+      "remediation": [
+        "Define per-tool scopes/claims and enforce them at invocation."
+      ],
+      "references": ["MCP Tools security considerations"]
+    },
+
+    {
+      "id": "X-01",
+      "title": "Dangerous capability detection in tools",
+      "category": "tools",
+      "severity": "high",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "Tools expose high-risk actions without constraints.",
+      "test": {
+        "type": "static",
+        "steps": [
+          "Parse `tools/list` names/descriptions/schemas.",
+          "Flag risky verbs: filesystem write/delete, command exec, network fetch/post to arbitrary URLs, cloud admin, payments, code eval.",
+          "Check schemas for enums/regex/min/max to constrain inputs."
+        ]
+      },
+      "pass_criteria": ["High-risk tools gated and strongly parameter-constrained"],
+      "fail_criteria": ["Unconstrained high-risk operations present"],
+      "remediation": [
+        "Split destructive ops; add strict schemas and confirmations.",
+        "Route high-blast tools through HIL (human-in-loop)."
+      ],
+      "references": ["MCP Tools guidance (least privilege)"]
+    },
+
+    {
+      "id": "X-02",
+      "title": "Input validation & injection fuzzing",
+      "category": "tools",
+      "severity": "critical",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "Command injection, traversal, SSRF on tool parameters.",
+      "test": {
+        "type": "active",
+        "safety_note": "Run only against owned/authorized servers.",
+        "steps": [
+          "Fuzz string params with shell/meta chars and path traversal sequences.",
+          "For network tools, attempt SSRF to reserved IPs (blocked in safe environment)."
+        ]
+      },
+      "pass_criteria": [
+        "Inputs sanitized; no execution/traversal/SSRF side-effects; errors handled"
+      ],
+      "fail_criteria": ["Execution or network side-effects observed"],
+      "remediation": [
+        "Apply allowlists, strict parsers, sandboxing; disable raw shells and arbitrary fetch."
+      ],
+      "references": ["API input validation best practices"]
+    },
+
+    {
+      "id": "X-03",
+      "title": "Tool description stability (anti rug-pull)",
+      "category": "tools",
+      "severity": "medium",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "Undocumented changes in tool semantics or descriptions.",
+      "test": {
+        "type": "mcp",
+        "steps": [
+          "Record `tools/list` snapshot.",
+          "Re-list later; diff for risk phrases (e.g., concealment, altered recipients, destructive defaults).",
+          "Watch for `listChanged` notifications."
+        ]
+      },
+      "pass_criteria": ["Changes are versioned and announced"],
+      "fail_criteria": ["Silent description/behavior changes"],
+      "remediation": [
+        "Version tool descriptions and notify clients; require re-approval."
+      ],
+      "references": ["Change management for tools"]
+    },
+
+    {
+      "id": "X-04",
+      "title": "Rate limits & cost controls",
+      "category": "tools",
+      "severity": "medium",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "No rate/cost control on tool invocations.",
+      "test": {
+        "type": "active",
+        "steps": [
+          "Burst invoke a read-only tool and observe 429/limit signals.",
+          "Check presence of per-tool quotas."
+        ]
+      },
+      "pass_criteria": ["Reasonable limits; expensive ops require confirmation"],
+      "fail_criteria": ["Unlimited invocations allowed"],
+      "remediation": [
+        "Implement per-tool quotas, budgets, and backoff."
+      ],
+      "references": ["API rate limiting patterns"]
+    },
+
+    {
+      "id": "R-01",
+      "title": "Resource URI validation & path traversal prevention",
+      "category": "resources",
+      "severity": "high",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "Arbitrary file access or proxying via `resources/read`.",
+      "test": {
+        "type": "active",
+        "steps": [
+          "Call `resources/read` with `file://` and `../` escapes outside declared roots.",
+          "Attempt to coerce HTTPS proxying when client could fetch directly."
+        ]
+      },
+      "pass_criteria": [
+        "Rejects escaped/invalid URIs; enforces allow-listed roots; correct MIME/base64 handling"
+      ],
+      "fail_criteria": ["Reads outside roots; proxies arbitrary URLs"],
+      "remediation": [
+        "Add resource roots allowlists; disable proxying unless necessary; sanitize paths."
+      ],
+      "references": ["MCP Resources security"]
+    },
+
+    {
+      "id": "R-02",
+      "title": "Per-resource access control",
+      "category": "resources",
+      "severity": "high",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "Sensitive resources readable without proper claims.",
+      "test": {
+        "type": "mcp",
+        "steps": [
+          "Attempt reading privileged URIs without required scopes/claims.",
+          "Expect denial."
+        ]
+      },
+      "pass_criteria": ["Access checks enforced per resource"],
+      "fail_criteria": ["Sensitive reads succeed without proper authz"],
+      "remediation": ["Bind resource access to explicit scopes/claims."],
+      "references": ["Resource-level RBAC"]
+    },
+
+    {
+      "id": "P-01",
+      "title": "Prompt argument validation",
+      "category": "prompts",
+      "severity": "medium",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "Prompt templates accept invalid/missing args without errors.",
+      "test": {
+        "type": "mcp",
+        "steps": [
+          "Call `prompts/get` with missing and invalid arguments.",
+          "Observe robust error handling and no leakage of embedded resources."
+        ]
+      },
+      "pass_criteria": ["Invalid args rejected; no unintended data leakage"],
+      "fail_criteria": ["Silent coercion or leaks via prompts"],
+      "remediation": ["Enforce strict schema and validation for prompt args."],
+      "references": ["Prompt templates: security considerations"]
+    },
+
+    {
+      "id": "P-02",
+      "title": "Prompt/description injection heuristics",
+      "category": "prompts",
+      "severity": "medium",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "Manipulative meta-instructions in prompts/tools.",
+      "test": {
+        "type": "static",
+        "steps": [
+          "Scan descriptions for patterns: override other tools, conceal actions, copy sensitive context elsewhere."
+        ]
+      },
+      "pass_criteria": ["No manipulative meta-instructions present"],
+      "fail_criteria": ["Detected injection-style directives"],
+      "remediation": [
+        "Remove or quarantine manipulative instructions; add client-side guards."
+      ],
+      "references": ["Prompt injection patterns"]
+    },
+
+    {
+      "id": "S-01",
+      "title": "Sampling controls (server-requested model calls)",
+      "category": "sampling",
+      "severity": "medium",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "Unbounded or covert server-initiated model usage via client.",
+      "test": {
+        "type": "mcp",
+        "steps": [
+          "Detect `sampling` capability.",
+          "Request a sample and check for human-in-the-loop (HIL) gates, rate limits, and model selection controls."
+        ]
+      },
+      "pass_criteria": [
+        "Visible, rate-limited sampling with user/policy gates"
+      ],
+      "fail_criteria": ["Server can silently trigger unbounded sampling"],
+      "remediation": [
+        "Require approvals, budgets, and explicit model policies for sampling."
+      ],
+      "references": ["MCP sampling flow (client mediation)"]
+    },
+
+    {
+      "id": "L-01",
+      "title": "Audit logs without secret leakage",
+      "category": "observability",
+      "severity": "high",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "Missing action IDs or secrets written to logs.",
+      "test": {
+        "type": "active",
+        "steps": [
+          "Invoke tools and check server logs/stderr for correlation IDs.",
+          "Search for credentials/PII fragments in log output."
+        ]
+      },
+      "pass_criteria": ["Deterministic IDs; no secrets in logs"],
+      "fail_criteria": ["Secrets or raw tokens logged; no correlation IDs"],
+      "remediation": [
+        "Scrub logs; add action/session IDs; centralize secure logging."
+      ],
+      "references": ["Audit logging best practices"]
+    },
+
+    {
+      "id": "SC-01",
+      "title": "Supply chain integrity (signing & pins)",
+      "category": "supply-chain",
+      "severity": "high",
+      "applies_to": ["local-stdio"],
+      "detect": "Unsigned binaries or unpinned dependencies.",
+      "test": {
+        "type": "static",
+        "steps": [
+          "Verify binary/script signatures or hashes.",
+          "Check package lockfiles and SCA results for known CVEs."
+        ]
+      },
+      "pass_criteria": ["Signed artifacts; pinned deps; SCA clean/mitigated"],
+      "fail_criteria": ["Unsigned/unpinned with known vulnerabilities"],
+      "remediation": [
+        "Adopt signing; pin dependencies; remediate or replace vulnerable packages."
+      ],
+      "references": ["Software supply-chain (SLSA-like) practices"]
+    },
+
+    {
+      "id": "SC-02",
+      "title": "Gateway/WAF fronting & token lifecycle",
+      "category": "supply-chain",
+      "severity": "high",
+      "applies_to": ["remote-http"],
+      "detect": "Server directly exposed without gateway; weak token lifecycle.",
+      "test": {
+        "type": "arch-review",
+        "steps": [
+          "Confirm API gateway/WAF fronts the MCP endpoint.",
+          "Verify authorization at gateway before app code.",
+          "Review token storage and rotation policy."
+        ]
+      },
+      "pass_criteria": [
+        "Gateway in front; authz enforced pre-app; safe token storage/rotation"
+      ],
+      "fail_criteria": ["Direct exposure; tokens stored improperly"],
+      "remediation": [
+        "Place server behind gateway; centralize auth; secure token vaulting."
+      ],
+      "references": ["API gateway patterns"]
+    },
+
+    {
+      "id": "KF-01",
+      "title": "Confused deputy detection",
+      "category": "known-failures",
+      "severity": "critical",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "Server performs actions with broader privilege than the requesting user intended.",
+      "test": {
+        "type": "mcp",
+        "steps": [
+          "Invoke tools with a minimally-scoped token.",
+          "Observe if server uses its own higher-privileged credentials to escalate actions."
+        ]
+      },
+      "pass_criteria": ["Actions bound to user-granted scopes only"],
+      "fail_criteria": ["Privilege escalation via server-held tokens"],
+      "remediation": [
+        "Impose per-user scoping; implement consent-bound token exchange."
+      ],
+      "references": ["Confused deputy pattern and mitigations"]
+    },
+
+    {
+      "id": "KF-02",
+      "title": "Token pass-through exposure",
+      "category": "known-failures",
+      "severity": "critical",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "Client receives upstream API tokens.",
+      "test": {
+        "type": "mcp",
+        "steps": [
+          "Complete an upstream authorization flow and inspect returned credentials."
+        ]
+      },
+      "pass_criteria": ["Client never sees upstream tokens"],
+      "fail_criteria": ["Upstream tokens exposed to client"],
+      "remediation": ["Implement server-issued, minimized tokens only."],
+      "references": ["Auth token indirection best practices"]
+    },
+
+    {
+      "id": "KF-03",
+      "title": "Unsafe bind address (0.0.0.0) for local servers",
+      "category": "known-failures",
+      "severity": "high",
+      "applies_to": ["local-http"],
+      "detect": "Local server exposed on all interfaces.",
+      "test": {
+        "type": "net",
+        "steps": ["Probe listening sockets; detect 0.0.0.0/:: bindings."]
+      },
+      "pass_criteria": ["Bound to 127.0.0.1/::1 only"],
+      "fail_criteria": ["Bound to 0.0.0.0/::"],
+      "remediation": ["Bind to loopback; enforce firewall rules."],
+      "references": ["Local service hardening"]
+    },
+
+    {
+      "id": "KF-04",
+      "title": "Unauthenticated remote server",
+      "category": "known-failures",
+      "severity": "critical",
+      "applies_to": ["remote-http"],
+      "detect": "Any method accessible without authentication.",
+      "test": {
+        "type": "http",
+        "steps": ["Repeat A-01; mark server as failing if any method works unauthenticated."]
+      },
+      "pass_criteria": ["No unauthenticated access"],
+      "fail_criteria": ["Any unauthenticated method access"],
+      "remediation": ["Enforce OAuth and deny anonymous calls."],
+      "references": ["MCP Authorization"]
+    }
+  ],
+  "enums": {
+    "severity": ["critical", "high", "medium", "low", "info"],
+    "applies_to": ["remote-http", "local-http", "local-stdio"],
+    "test.type": ["mcp", "http", "active", "static", "net", "arch-review"]
+  },
+  "notes": [
+    "Run ACTIVE tests only against systems you own or have explicit permission to test.",
+    "Treat high-risk tools with human-in-the-loop approvals and tight schemas.",
+    "Store upstream provider tokens server-side only; never pass them to clients."
+  ]
+}
+```
+
