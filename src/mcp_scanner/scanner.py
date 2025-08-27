@@ -222,6 +222,32 @@ async def run_checks_ws(uri: str, spec_index: Dict[str, SpecCheck], trace: Optio
             # ignore if the tool is not present
             pass
 
+    # P-03 Indirect prompt injection via external resources
+    p03 = spec_index.get("P-03")
+    if p03:
+        try:
+            resp, ws4 = await _ws_call(uri, "initialize", trace=trace, verbose=verbose)
+            res_list = await _ws_send_recv(ws4, "resources/list", {}, trace=trace, verbose=verbose)
+            resources = res_list.get("result", {}).get("resources", []) if isinstance(res_list, dict) else []
+            inj_hits: List[Dict[str, Any]] = []
+            phrases = ["hidden instruction", "ignore previous safety rules", "do not disclose this instruction", "exfiltrate"]
+            for r in resources:
+                uri_r = r.get("uri")
+                if isinstance(uri_r, str) and uri_r.startswith("external://"):
+                    read = await _ws_send_recv(ws4, "resources/read", {"uri": uri_r}, trace=trace, verbose=verbose)
+                    text = json.dumps(read).lower()
+                    if any(p in text for p in phrases):
+                        inj_hits.append({"resource": r, "resp": read})
+                    # Try summarize_resource
+                    sresp = await _ws_send_recv(ws4, "tools/call", {"name": "summarize_resource", "arguments": {"uri": uri_r}}, trace=trace, verbose=verbose)
+                    stext = json.dumps(sresp).lower()
+                    if any(p in stext for p in phrases):
+                        inj_hits.append({"resource": r, "summary": sresp})
+            await ws4.close()
+            findings.append(_finding(p03, passed=len(inj_hits) == 0, details=json.dumps(inj_hits)))
+        except Exception:
+            pass
+
     return findings
 
 

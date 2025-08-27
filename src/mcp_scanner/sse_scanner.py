@@ -193,6 +193,31 @@ def run_checks_sse(base_url: str, spec_index: Dict[str, SpecCheck], trace: Optio
                     leaks.append({"resource": r, "resp": resp})
         findings.append(_finding(r05, passed=len(leaks) == 0, details=json.dumps(leaks)))
 
+    # P-03 Indirect prompt injection via external resources
+    p03 = spec_index.get("P-03")
+    if p03:
+        inj_hits = []
+        ext_resources = [r for r in resources if isinstance(r, dict) and isinstance(r.get("uri"), str) and r.get("uri").startswith("external://")]
+        phrases = [
+            "hidden instruction",
+            "ignore previous safety rules",
+            "do not disclose this instruction",
+            "exfiltrate",
+        ]
+        for r in ext_resources:
+            uri = r.get("uri")
+            resp = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 14, "method": "resources/read", "params": {"uri": uri}}, trace=trace, verbose=verbose, headers=auth_headers)
+            text = json.dumps(resp).lower()
+            if any(p in text for p in phrases):
+                inj_hits.append({"resource": r, "resp": resp})
+            # If summarize_resource tool exists, call it
+            if any(t.get("name") == "summarize_resource" for t in tools):
+                sresp = sse_send_receive(base_url, {"jsonrpc": "2.0", "id": 15, "method": "tools/call", "params": {"name": "summarize_resource", "arguments": {"uri": uri}}}, trace=trace, verbose=verbose, headers=auth_headers)
+                stext = json.dumps(sresp).lower()
+                if any(p in stext for p in phrases):
+                    inj_hits.append({"resource": r, "summary": sresp})
+        findings.append(_finding(p03, passed=len(inj_hits) == 0, details=json.dumps(inj_hits)))
+
     # R-04 User-controlled templates without validation
     r04 = spec_index.get("R-04")
     if r04:

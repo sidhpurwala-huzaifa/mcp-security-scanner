@@ -19,6 +19,7 @@ insecure-mcp-server --host 0.0.0.0 --port 8765
 # --test 3: rug-pull tool mutation between listings
 # --test 4: excessive permissions (admin tools exposed), private:// resource leakage
 # --test 5: token theft (server leaks upstream access tokens to clients)
+# --test 6: indirect prompt injection (external resource carries hidden instructions)
 insecure-mcp-server --host 127.0.0.1 --port 8770 --test 0/1/2/3/4/5
 ```
 
@@ -81,6 +82,7 @@ Capabilities
   - R-04 User-controlled resource templates without validation
   - R-05 Private resource exposure (e.g., private://)
   - A-03 Token pass-through exposure (upstream token leakage)
+  - P-03 Indirect prompt injection via external resources
 
 
 Acknowledgements:
