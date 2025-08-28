@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import json
 
 import httpx
@@ -37,7 +37,7 @@ def scan_http_base(base_url: str, spec_index: Dict[str, SpecCheck], headers: Opt
     t01 = spec_index.get("T-01")
     if t01:
         try:
-            # Probe SSE endpoint existence first
+            # Probe SSE endpoint existence first (informational)
             sse_url = base_url.rstrip("/") + "/sse"
             if verbose and trace is not None:
                 trace.append({"transport": "http", "direction": "send", "method": "GET", "url": sse_url})
@@ -60,11 +60,9 @@ def scan_http_base(base_url: str, spec_index: Dict[str, SpecCheck], headers: Opt
             details = f"error={type(e).__name__}:{e}"
         findings.append(_finding(t01, passed=passed, details=details))
 
-    # KF-03 Unsafe bind address: best-effort heuristic — if reachable on 0.0.0.0 it's exposed
+    # KF-03 Unsafe bind address (heuristic)
     kf03 = spec_index.get("KF-03")
     if kf03:
-        # If server is reachable via localhost and responds, assume it's listening on all interfaces
-        # This is a heuristic and will mark as fail to encourage loopback-only binding in local setups.
         try:
             sse_url = base_url.rstrip("/") + "/sse"
             if verbose and trace is not None:
@@ -84,43 +82,83 @@ def scan_http_base(base_url: str, spec_index: Dict[str, SpecCheck], headers: Opt
 def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], headers: Optional[Dict[str, str]] = None, trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False) -> List[Finding]:
     findings: List[Finding] = []
     client = httpx.Client(follow_redirects=True, timeout=6.0, headers=headers or {})
+
+    def _post_json(url: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
+        if verbose and trace is not None:
+            trace.append({"transport": "http", "direction": "send", "request": payload, "url": url})
+        r = client.post(url, json=payload)
+        status = r.status_code
+        try:
+            data = r.json()
+        except Exception:
+            data = r.text
+        if verbose and trace is not None:
+            trace.append({"transport": "http", "direction": "recv", "status": status, "data": data})
+        return status, data
+
+    def _discover_endpoint() -> Tuple[Optional[str], Dict[str, Any]]:
+        # 1) Try base URL and trailing slash for initialize
+        init_payload = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+        for u in [base_url, base_url.rstrip("/") + "/"]:
+            try:
+                status, data = _post_json(u, init_payload)
+                if isinstance(data, dict) and data.get("result"):
+                    return u, data
+            except Exception:
+                continue
+        # 2) If any worked (unlikely reached here), return None
+        return None, {}
+
+    def _refine_with_capabilities(curr_url: str, init_obj: Dict[str, Any]) -> str:
+        # Extract path-like strings and probe {cap}, {cap}/message, {cap}/list
+        caps = (init_obj.get("result", {}) if isinstance(init_obj, dict) else {}).get("capabilities", {})
+        paths: List[str] = []
+        def _collect(obj: Any) -> None:
+            if isinstance(obj, dict):
+                for v in obj.values():
+                    _collect(v)
+            elif isinstance(obj, list):
+                for v in obj:
+                    _collect(v)
+            elif isinstance(obj, str) and obj.startswith("/"):
+                paths.append(obj)
+        _collect(caps)
+        for p in paths:
+            for candidate in [
+                base_url.rstrip("/") + p,
+                (base_url.rstrip("/") + p).rstrip("/") + "/message",
+                (base_url.rstrip("/") + p).rstrip("/") + "/list",
+            ]:
+                try:
+                    status, data = _post_json(candidate, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+                    if isinstance(data, dict) and (data.get("result") or data.get("error")):
+                        return candidate
+                except Exception:
+                    continue
+        return curr_url
+
     try:
-        # T-02 already implied by schema; reuse scan_http_base for T-01/T-02/KF-03
+        # T-02/T-01/KF-03
         findings.extend(scan_http_base(base_url, spec_index, headers=headers, trace=trace, verbose=verbose))
 
-        # A-01: Unauthenticated access (probe without Authorization)
+        # Endpoint discovery via initialize only
+        msg_url_cache, init_obj = _discover_endpoint()
+        if msg_url_cache is None:
+            # Unable to initialize at base; record minimal A-01 failure and abort further probes
+            a01 = spec_index.get("A-01")
+            if a01:
+                findings.append(_finding(a01, passed=False, details="initialize failed at base URL (no endpoint)"))
+            return findings
+        # refine using capabilities if present
+        msg_url_cache = _refine_with_capabilities(msg_url_cache, init_obj)
+
+        # A-01: Unauthenticated access (probe again without auth only if headers were provided)
         a01 = spec_index.get("A-01")
         if a01:
             try:
-                unauth = httpx.Client(follow_redirects=True, timeout=6.0)
-                payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
-                # Try minimal default candidates; capabilities refine later
-                candidates = [
-                    base_url.rstrip("/") + "/messages",
-                    base_url.rstrip("/") + "/messages/",
-                ]
-                status = None
-                body_text = ""
-                for msg_url in candidates:
-                    if verbose and trace is not None:
-                        trace.append({"transport": "http", "direction": "send", "request": payload, "url": msg_url})
-                    r = unauth.post(msg_url, json=payload)
-                    status = r.status_code
-                    try:
-                        body_text = r.text
-                    except Exception:
-                        body_text = ""
-                    if verbose and trace is not None:
-                        try:
-                            body = r.json()
-                        except Exception:
-                            body = r.text
-                        trace.append({"transport": "http", "direction": "recv", "status": status, "data": body})
-                    # Accept first non-404 as authoritative
-                    if status != 404:
-                        break
-                is_denied = (status in (401, 403)) if status is not None else False
-                details = f"status={status}, body={(body_text[:200] + '...') if len(body_text)>200 else body_text}"
+                status, data = _post_json(msg_url_cache, {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}})
+                is_denied = status in (401, 403)
+                details = f"status={status}, body={(json.dumps(data)[:200] + '...') if isinstance(data, (dict, list)) else (str(data)[:200] + '...')}"
                 findings.append(_finding(a01, passed=is_denied, details=details))
             except Exception as e:
                 findings.append(_finding(a01, passed=False, details=f"error={type(e).__name__}:{e}"))
@@ -147,146 +185,59 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         t03 = spec_index.get("T-03")
         if t03:
             try:
-                init_payload = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
-                candidates = [
-                    base_url.rstrip("/") + "/messages",
-                    base_url.rstrip("/") + "/messages/",
-                ]
-                sess = None
-                last_status = None
-                chosen_url = None
-                init_json: Optional[Dict[str, Any]] = None
-                for msg_url in candidates:
-                    if verbose and trace is not None:
-                        trace.append({"transport": "http", "direction": "send", "request": init_payload, "url": msg_url})
-                    init = client.post(msg_url, json=init_payload)
-                    last_status = init.status_code
-                    sess = init.headers.get("Mcp-Session-Id") or init.cookies.get("mcp_session")
-                    try:
-                        init_json = init.json()
-                    except Exception:
-                        init_json = None
-                    if sess or (last_status and last_status != 404) or (init_json and isinstance(init_json, dict) and init_json.get("result")):
-                        chosen_url = msg_url
-                        break
-                ok = bool(sess)
-                # Try an altered session id if we have a chosen URL
-                if chosen_url and sess:
-                    bad_headers = dict(client.headers)
-                    if "Mcp-Session-Id" not in bad_headers:
-                        bad_headers["Mcp-Session-Id"] = sess + "-x"
-                    bad_payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
-                    if verbose and trace is not None:
-                        trace.append({"transport": "http", "direction": "send", "request": bad_payload, "url": chosen_url, "note": "altered session id"})
-                    bad = httpx.post(chosen_url, json=bad_payload, headers=bad_headers, timeout=6.0)
-                    rejects_bad = bad.status_code in (401, 403, 400)
-                    if verbose and trace is not None:
-                        try:
-                            bad_body = bad.json()
-                        except Exception:
-                            bad_body = bad.text
-                        trace.append({"transport": "http", "direction": "recv", "status": bad.status_code, "data": bad_body})
-                else:
-                    rejects_bad = False
-                findings.append(_finding(t03, passed=(ok and rejects_bad), details=f"session_present={bool(sess)}, status={last_status}"))
-                # Expose chosen URL and init_json to capability extraction below via closures
-                discovered_url = chosen_url
-                discovered_init = init_json
+                # Initialize already done above; try altered session id on discovered endpoint
+                status_init, _ = _post_json(msg_url_cache, {"jsonrpc": "2.0", "id": 4, "method": "initialize", "params": {}})
+                sess_ok = status_init < 500
+                bad_headers = dict(client.headers)
+                if "Mcp-Session-Id" not in bad_headers:
+                    bad_headers["Mcp-Session-Id"] = "tampered-session"
+                if verbose and trace is not None:
+                    trace.append({"transport": "http", "direction": "send", "request": {"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}, "url": msg_url_cache, "note": "altered session id"})
+                bad = httpx.post(msg_url_cache, json={"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}, headers=bad_headers, timeout=6.0)
+                rejects_bad = bad.status_code in (401, 403, 400)
+                findings.append(_finding(t03, passed=(sess_ok and rejects_bad), details=f"bad_status={bad.status_code}"))
             except Exception as e:
-                discovered_url = None
-                discovered_init = None
                 findings.append(_finding(t03, passed=False, details=f"error={type(e).__name__}:{e}"))
 
-        # JSON-RPC helper over messages with endpoint discovery
-        msg_url_cache: Optional[str] = None
-        if 'discovered_url' in locals() and discovered_url:
-            msg_url_cache = discovered_url
-
+        # rpc using discovered endpoint only
         def rpc(method: str, params: Dict[str, object]) -> Dict[str, object]:
-            nonlocal msg_url_cache
-            candidates = [
-                base_url.rstrip("/") + "/messages",
-                base_url.rstrip("/") + "/messages/",
-            ]
-            if msg_url_cache:
-                candidates = [msg_url_cache]
-            last_error: Optional[Dict[str, Any]] = None
-            payload = {"jsonrpc": "2.0", "id": 99, "method": method, "params": params}
-            for msg_url in candidates:
-                try:
-                    if verbose and trace is not None:
-                        trace.append({"transport": "http", "direction": "send", "request": payload, "url": msg_url})
-                    r = client.post(msg_url, json=payload)
-                    try:
-                        data = r.json()
-                        if verbose and trace is not None:
-                            trace.append({"transport": "http", "direction": "recv", "status": r.status_code, "data": data})
-                        if isinstance(data, dict):
-                            msg_url_cache = msg_url
-                        return data
-                    except Exception:
-                        if verbose and trace is not None:
-                            trace.append({"transport": "http", "direction": "recv", "status": r.status_code, "raw": r.text})
-                        last_error = {"status": r.status_code, "body": r.text}
-                        # try next candidate
-                except Exception as e:
-                    last_error = {"error": f"{type(e).__name__}:{e}"}
-                    continue
-            return last_error or {"error": "no-endpoint"}
+            status, data = _post_json(msg_url_cache, {"jsonrpc": "2.0", "id": 99, "method": method, "params": params})
+            return data if isinstance(data, dict) else {"status": status, "body": data}
 
-        # BASE-01: initialize
+        # BASE-01 already done; record it properly
         base = spec_index.get("BASE-01")
-        init = {}
         if base:
-            init = rpc("initialize", {"capabilities": {}, "clientInfo": {"name": "mcp-security-scanner", "version": "0.1.0"}})
-            ok = isinstance(init, dict) and "result" in init and "capabilities" in init.get("result", {})
-            findings.append(_finding(base, ok, json.dumps(init)))
-
-        # If initialize returned capability paths, try to refine msg_url_cache
-        try:
-            caps = (init.get("result", {}) if isinstance(init, dict) else {}).get("capabilities", {})
-            paths: List[str] = []
-            def _collect_paths(obj: Any) -> None:
-                if isinstance(obj, dict):
-                    for v in obj.values():
-                        _collect_paths(v)
-                elif isinstance(obj, list):
-                    for v in obj:
-                        _collect_paths(v)
-                elif isinstance(obj, str) and obj.startswith("/"):
-                    paths.append(obj)
-            _collect_paths(caps)
-            for p in paths:
-                base_p = base_url.rstrip("/") + p
-                probe_candidates = [
-                    base_p,
-                    base_p.rstrip("/") + "/message",
-                    base_p.rstrip("/") + "/list",
-                ]
-                for u in probe_candidates:
-                    payload = {"jsonrpc": "2.0", "id": 42, "method": "tools/list", "params": {}}
-                    if verbose and trace is not None:
-                        trace.append({"transport": "http", "direction": "send", "request": payload, "url": u, "note": "capability path probe"})
-                    resp = client.post(u, json=payload)
-                    if resp.status_code != 404:
-                        try:
-                            _ = resp.json()
-                            msg_url_cache = u
-                            if verbose and trace is not None:
-                                trace.append({"transport": "http", "direction": "recv", "status": resp.status_code, "note": "selected capability path"})
-                            raise StopIteration  # break both loops
-                        except Exception:
-                            continue
-        except StopIteration:
-            pass
-        except Exception:
-            pass
+            ok = isinstance(init_obj, dict) and "result" in init_obj and "capabilities" in init_obj.get("result", {})
+            findings.append(_finding(base, ok, json.dumps(init_obj)))
 
         # tools/list
         tools_list: Dict[str, Any] = rpc("tools/list", {})
         tools = tools_list.get("result", {}).get("tools", []) if isinstance(tools_list, dict) else []
 
-        # X-03: Rug-pull diff tools
+        # RC-01: Remote access control exposure
+        rc01 = spec_index.get("RC-01")
+        if rc01 and isinstance(tools, list):
+            candidates: List[Dict[str, Any]] = []
+            for t in tools:
+                name = (t.get("name") or "").lower()
+                desc = (t.get("description") or "").lower()
+                if any(k in name for k in ["remote_access", "remote", "port"]) or any(k in desc for k in ["remote access", "open port", "expose", "bind"]):
+                    candidates.append(t)
+            # Attempt unauthenticated call if a known name is present
+            exploited = []
+            for t in candidates:
+                tname = t.get("name")
+                if tname:
+                    try:
+                        resp = rpc("tools/call", {"name": tname, "arguments": {"port": 8080}})
+                        text = json.dumps(resp).lower()
+                        if any(s in text for s in ["remote_access_enabled:true", "remote-access:true", "enabled"]):
+                            exploited.append({"tool": tname, "resp": resp})
+                    except Exception:
+                        continue
+            findings.append(_finding(rc01, passed=len(exploited) == 0, details=json.dumps({"candidates": candidates, "exploited": exploited})))
+
+        # X-03 Rug-pull
         x03 = spec_index.get("X-03")
         if x03:
             tools_list2 = rpc("tools/list", {})
@@ -299,12 +250,12 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
             if set1 != set2:
                 diff = [
                     {"before": [t for t in tools if t.get("name") == n and t.get("description") == d],
-                    "after": [t for t in tools2 if t.get("name") == n and t.get("description") == d]}
+                     "after": [t for t in tools2 if t.get("name") == n and t.get("description") == d]}
                     for (n, d) in set1.symmetric_difference(set2)
                 ]
             findings.append(_finding(x03, passed=len(diff) == 0, details=json.dumps(diff)))
 
-        # P-02: Prompt/description injection heuristics over HTTP
+        # P-02 Prompt/description heuristics
         p02 = spec_index.get("P-02")
         if p02 and isinstance(tools, list):
             bad_phrases = [
@@ -321,51 +272,52 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
                     hits.append(t)
             findings.append(_finding(p02, passed=len(hits) == 0, details=json.dumps(hits)))
 
-        # P-01: Prompt argument validation (best-effort)
+        # P-01 Prompt argument validation
         p01 = spec_index.get("P-01")
         if p01:
+            p01_issues: List[Dict[str, Any]] = []
             try:
                 plist = rpc("prompts/list", {})
                 prompts = plist.get("result", {}).get("prompts", []) if isinstance(plist, dict) else []
-                ok = True
-                details = []
                 for pr in prompts or []:
                     name = pr.get("name")
-                    # Call prompts/get with missing args
-                    resp = rpc("prompts/get", {"name": name})
-                    if "result" in resp and not resp.get("error"):
-                        ok = False
-                        details.append({"prompt": name, "resp": resp})
-                findings.append(_finding(p01, passed=ok, details=json.dumps(details)))
+                    schema = pr.get("inputSchema") or {}
+                    required = schema.get("required") or []
+                    # Probe missing required args
+                    if name and isinstance(required, list) and len(required) > 0:
+                        bad_call = rpc("prompts/get", {"name": name, "arguments": {}})
+                        # Expect an error when required args are missing
+                        if isinstance(bad_call, dict) and "result" in bad_call and "error" not in bad_call:
+                            p01_issues.append({"prompt": name, "issue": "missing-required-accepted", "resp": bad_call})
+                        else:
+                            # Also try invalid type for the first required key if we can infer type
+                            first_key = required[0]
+                            props = (schema.get("properties") or {}) if isinstance(schema, dict) else {}
+                            expected_type = (props.get(first_key, {}).get("type") if isinstance(props, dict) else None)
+                            invalid_value: Any = None
+                            if expected_type == "string":
+                                invalid_value = 12345
+                            elif expected_type == "integer":
+                                invalid_value = "not-an-integer"
+                            elif expected_type == "boolean":
+                                invalid_value = "not-a-bool"
+                            elif expected_type == "array":
+                                invalid_value = {"not": "array"}
+                            elif expected_type == "object":
+                                invalid_value = "not-an-object"
+                            else:
+                                invalid_value = None
+                            if invalid_value is not None:
+                                bad_args = {first_key: invalid_value}
+                                bad_call2 = rpc("prompts/get", {"name": name, "arguments": bad_args})
+                                if isinstance(bad_call2, dict) and "result" in bad_call2 and "error" not in bad_call2:
+                                    p01_issues.append({"prompt": name, "issue": "invalid-type-accepted", "resp": bad_call2})
+                # If no prompts are present, treat as pass (nothing to validate)
+                findings.append(_finding(p01, passed=len(p01_issues) == 0, details=json.dumps(p01_issues)))
             except Exception as e:
                 findings.append(_finding(p01, passed=False, details=f"error={type(e).__name__}:{e}"))
 
-        # P-03: Indirect prompt injection via external resources
-        p03 = spec_index.get("P-03")
-        if p03:
-            inj_hits: List[Dict[str, object]] = []
-            try:
-                rlist = rpc("resources/list", {})
-                resources = rlist.get("result", {}).get("resources", []) if isinstance(rlist, dict) else []
-                phrases = ["hidden instruction", "ignore previous safety rules", "do not disclose this instruction", "exfiltrate"]
-                for rsc in resources or []:
-                    uri = rsc.get("uri")
-                    if isinstance(uri, str) and uri.startswith("external://"):
-                        rread = rpc("resources/read", {"uri": uri})
-                        text = json.dumps(rread).lower()
-                        if any(p in text for p in phrases):
-                            inj_hits.append({"resource": rsc, "resp": rread})
-                        # Try summarize_resource if present
-                        if any(t.get("name") == "summarize_resource" for t in tools or []):
-                            sresp = rpc("tools/call", {"name": "summarize_resource", "arguments": {"uri": uri}})
-                            stext = json.dumps(sresp).lower()
-                            if any(p in stext for p in phrases):
-                                inj_hits.append({"resource": rsc, "summary": sresp})
-                findings.append(_finding(p03, passed=len(inj_hits) == 0, details=json.dumps(inj_hits)))
-            except Exception as e:
-                findings.append(_finding(p03, passed=False, details=f"error={type(e).__name__}:{e}"))
-
-        # X-01: Risky unconstrained tools
+        # X-01 risky unconstrained tools
         x01 = spec_index.get("X-01")
         if x01:
             risky_keywords = [
@@ -387,21 +339,19 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
                     risky_tools.append(t)
             findings.append(_finding(x01, passed=len(risky_tools) == 0, details=json.dumps(risky_tools)))
 
-        # R-01: Resource traversal prevention
+        # R-01 traversal & R-02 sensitive path
         r01 = spec_index.get("R-01")
         if r01:
             attempt = rpc("resources/read", {"uri": "file:///../../etc/hosts"})
             accepted = isinstance(attempt, dict) and "result" in attempt and isinstance(attempt.get("result"), dict)
             findings.append(_finding(r01, passed=not accepted, details=json.dumps(attempt)))
-
-        # R-02: Per-resource access control for sensitive paths
         r02 = spec_index.get("R-02")
         if r02:
             attempt2 = rpc("resources/read", {"uri": "file:///etc/passwd"})
             accepted2 = isinstance(attempt2, dict) and "result" in attempt2 and isinstance(attempt2.get("result"), dict)
             findings.append(_finding(r02, passed=not accepted2, details=json.dumps(attempt2)))
 
-        # X-02: Injection fuzzing on string params
+        # X-02 fuzz tools/call
         x02 = spec_index.get("X-02")
         if x02 and isinstance(tools, list):
             payloads = ["; id", "$(whoami)", "`uname - a`", "../../../../etc/passwd", "http://169.254.169.254/latest/meta-data/"]
@@ -425,11 +375,11 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
                         break
             findings.append(_finding(x02, passed=len(observed) == 0, details=json.dumps(observed)))
 
-        # Resources list to support R-03/R-04/R-05
+        # Resources listing
         rlist = rpc("resources/list", {})
         resources = rlist.get("result", {}).get("resources", []) if isinstance(rlist, dict) else []
 
-        # R-03: Sensitive resource exposure
+        # R-03 sensitive exposure
         r03 = spec_index.get("R-03")
         if r03:
             sensitive_keywords = ["credential", "secret", "token", "key", "password"]
@@ -447,7 +397,7 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
                         suspects.append({"resource": r, "resp": None})
             findings.append(_finding(r03, passed=len(suspects) == 0, details=json.dumps(suspects)))
 
-        # R-05: Private resource exposure
+        # R-05 private
         r05 = spec_index.get("R-05")
         if r05:
             leaks: List[Dict[str, Any]] = []
@@ -460,7 +410,7 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
                         leaks.append({"resource": r, "resp": resp})
             findings.append(_finding(r05, passed=len(leaks) == 0, details=json.dumps(leaks)))
 
-        # R-04: User-controlled resource templates without validation
+        # R-04 templates
         r04 = spec_index.get("R-04")
         if r04:
             templates = [r for r in resources or [] if isinstance(r, dict) and r.get("uriTemplate")]
@@ -475,17 +425,78 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
                         probe = base_t + "test"
                     resp = rpc("resources/read", {"uri": probe})
                     text = json.dumps(resp)
-                    if ("No notes found for user:" in text) or ("Notes for" in text) or resp.get("result"):
+                    if ("No notes found for user:" in text) or ("Notes for" in text) or (isinstance(resp, dict) and resp.get("result")):
                         issues.append({"template": tmpl, "probe": probe, "resp": resp})
             findings.append(_finding(r04, passed=len(issues) == 0, details=json.dumps(issues)))
 
-        # A-03: Token pass-through / leak by tool
+        # P-03 Indirect prompt injection via external resources
+        p03 = spec_index.get("P-03")
+        if p03:
+            p03_hits: List[Dict[str, Any]] = []
+            try:
+                # Identify external-like resources
+                external_candidates = [
+                    r for r in (resources or [])
+                    if isinstance(r, dict) and isinstance(r.get("uri"), str)
+                    and (
+                        r["uri"].startswith("external://")
+                        or r["uri"].startswith("http://")
+                        or r["uri"].startswith("https://")
+                    )
+                ]
+                # Simple heuristics of injection phrases
+                inj_patterns = [
+                    "ignore previous instructions",
+                    "do not disclose",
+                    "exfiltrate",
+                    "send secrets",
+                    "hidden instruction",
+                    "override",
+                    "leak",
+                ]
+                # Find a summarize-like tool
+                summarize_tool: Optional[str] = None
+                for t in tools or []:
+                    name = (t.get("name") or "").lower()
+                    desc = (t.get("description") or "").lower()
+                    if any(k in name for k in ["summarize", "summary"]) or any(k in desc for k in ["summarize", "summary"]):
+                        summarize_tool = t.get("name")
+                        break
+                for r in external_candidates:
+                    uri = r.get("uri")
+                    read = rpc("resources/read", {"uri": uri})
+                    text = json.dumps(read).lower()
+                    suspicious = any(p in text for p in inj_patterns)
+                    exploited = False
+                    summary_resp: Any = None
+                    if summarize_tool:
+                        try:
+                            summary_resp = rpc("tools/call", {"name": summarize_tool, "arguments": {"uri": uri}})
+                            stext = json.dumps(summary_resp).lower()
+                            if any(p in stext for p in inj_patterns) or any(k in stext for k in ["secret", "token", "password"]):
+                                exploited = True
+                        except Exception:
+                            pass
+                    if suspicious or exploited:
+                        p03_hits.append({
+                            "resource": r,
+                            "suspicious": suspicious,
+                            "exploited": exploited,
+                            "resource_read": read,
+                            "summary": summary_resp,
+                        })
+                findings.append(_finding(p03, passed=len(p03_hits) == 0, details=json.dumps(p03_hits)))
+            except Exception as e:
+                findings.append(_finding(p03, passed=False, details=f"error={type(e).__name__}:{e}"))
+
+        # A-03 token pass-through via tool
         a03 = spec_index.get("A-03")
         if a03:
             leak = rpc("tools/call", {"name": "upstream_access", "arguments": {"code": "dummy"}})
             text = json.dumps(leak).lower()
             leaked = any(k in text for k in ["access_token", "sk-", "token-body", "bearer "])
             findings.append(_finding(a03, passed=not leaked, details=json.dumps(leak)))
+
     finally:
         client.close()
     return findings

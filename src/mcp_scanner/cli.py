@@ -12,6 +12,7 @@ from .models import Report
 from .spec import load_spec
 from .http_checks import run_full_http_checks, scan_http_base
 from .auth import build_auth_headers
+import httpx
 
 
 console = Console()
@@ -41,6 +42,15 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain: bo
         verbose = False
     trace: list[dict] = [] if (verbose or explain) else []
     auth_headers = build_auth_headers(auth_type, auth_token, token_url, client_id, client_secret, scope)
+
+    # Preflight reachability check
+    if not (url.lower().startswith("http://") or url.lower().startswith("https://")):
+        raise click.ClickException("--url must start with http:// or https://")
+    try:
+        with httpx.Client(follow_redirects=True, timeout=3.0) as _c:
+            _c.get(url)
+    except httpx.RequestError as e:  # noqa: PERF203
+        raise click.ClickException(f"Cannot reach MCP server at {url}: {type(e).__name__}: {e}")
 
     spec_file = Path(spec) if spec else Path(__file__).resolve().parents[2] / "scanner_specs.schema"
     spec_index = load_spec(spec_file)

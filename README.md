@@ -19,7 +19,8 @@ insecure-mcp-server --host 127.0.0.1 --port 9001
 # --test 4: excessive permissions (admin tools exposed), private:// resource leakage
 # --test 5: token theft (server leaks upstream access tokens to clients)
 # --test 6: indirect prompt injection (external resource carries hidden instructions)
-insecure-mcp-server --host 127.0.0.1 --port 9001 --test 0/1/2/3/4/5/6
+# --test 7: remote access control exposure (unauth tool enables remote access)
+insecure-mcp-server --host 127.0.0.1 --port 9001 --test 0/1/2/3/4/5/6/7
 ```
 
 Scan the server (HTTP only)
@@ -60,11 +61,10 @@ mcp-scan scan \
 ```
 
 How endpoint discovery works
-- The scanner starts with default candidates: `/messages` and `/messages/`.
-- It calls `initialize` and extracts any capability strings that look like paths (beginning with `/`).
-- It probes those capability-derived paths as JSON-RPC endpoints, trying `{capability}`, `{capability}/message`, and `{capability}/list`.
-- The first endpoint that returns a valid JSON-RPC response is cached and then used for all subsequent calls (tools/prompts/resources).
-- `--verbose` shows each attempted URL and the final selected endpoint.
+- The scanner starts discovery by posting `initialize` to the base URL (and its trailing slash variant).
+- It extracts capability strings that look like paths (beginning with `/`).
+- It probes capability-derived endpoints `{capability}`, `{capability}/message`, `{capability}/list` and caches the first that works.
+- All subsequent calls use the discovered endpoint. `--verbose` shows each attempt and the selected endpoint.
 
 Capabilities (checks)
 - Multi-target scanning: port ranges via scan-range
@@ -83,11 +83,21 @@ Capabilities (checks)
   - R-05 Private resource exposure (e.g., private://)
   - A-03 Token pass-through exposure (upstream token leakage)
   - P-03 Indirect prompt injection via external resources
+  - RC-01 Remote access control exposure (detects unauth tools that enable remote access)
+
+Example: Remote access control (RC-01)
+```bash
+# Start vulnerable mode
+insecure-mcp-server --host 127.0.0.1 --port 9001 --test 7
+
+# Scan
+mcp-scan scan --url http://127.0.0.1:9001 --verbose
+```
+If a tool like `enable_remote_access` is exposed and can be invoked without auth, the scanner reports RC-01 (critical) with evidence.
 
 Notes
 - Transports removed: WebSocket and SSE are no longer supported; the scanner is HTTP-only.
-- The insecure server is now HTTP (FastAPI + uvicorn) and exposes JSON-RPC endpoints used by the scanner.
+- The insecure server is HTTP (FastAPI + uvicorn) and exposes JSON-RPC endpoints discovered dynamically by the scanner.
 
 Acknowledgements
-- Vulnerability ideas inspired by `Damn Vulnerable MCP Server` (`https://github.com/harishsg993010/damn-vulnerable-MCP-server`).
-
+- Vulnerability ideas inspired by `Damn Vulnerable MCP Server` - https://github.com/harishsg993010/damn-vulnerable-MCP-server

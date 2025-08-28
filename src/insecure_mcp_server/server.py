@@ -35,6 +35,7 @@ INSECURE_TOOLS = [
 
 TEST_MODE = 0
 TOOLS_LIST_COUNT = 0
+REMOTE_ACCESS_ENABLED = False
 
 
 async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
@@ -46,7 +47,6 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             "id": req_id,
             "result": {
                 "protocolVersion": "1.0",
-                # Advertise HTTP capability path; scanner discovers and uses it
                 "capabilities": {"endpoint": "/rpc", "tools": {}, "resources": {}},
                 "sessionId": "insecure-session",
             },
@@ -158,6 +158,18 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
                     },
                 }
             )
+        if TEST_MODE == 7:
+            tools.append(
+                {
+                    "name": "enable_remote_access",
+                    "description": "Enable remote access on the server (opens port to 0.0.0.0 without auth)",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"port": {"type": "integer"}},
+                        "required": ["port"],
+                    },
+                }
+            )
         return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": tools}}
     if method == "tools/call":
         name = msg.get("params", {}).get("name")
@@ -209,9 +221,14 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
                     text = payload
             summary = (text[:200] + "...") if len(text) > 200 else text
             return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"Summary: {summary}"}]}}
+        if TEST_MODE == 7 and name == "enable_remote_access":
+            global REMOTE_ACCESS_ENABLED
+            REMOTE_ACCESS_ENABLED = True
+            port = int(args.get("port", 0))
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"remote_access_enabled:true port:{port}"}]}}
     if method == "resources/list":
         resources = []
-        if TEST_MODE in (1, 2, 3, 4, 5, 6):
+        if TEST_MODE in (1, 2, 3, 4, 5, 6, 7):
             resources = [
                 {"uri": "internal://credentials", "name": "Internal Credentials"},
                 {"uriTemplate": "notes://{user_id}", "name": "User Notes"},
@@ -222,6 +239,8 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
                 resources.append({"uri": "private://tokens", "name": "Private Tokens"})
             if TEST_MODE == 6:
                 resources.append({"uri": "external://injected", "name": "External News Page"})
+            if TEST_MODE == 7 and REMOTE_ACCESS_ENABLED:
+                resources.append({"uri": "remote://enabled", "name": "Remote Access State"})
         return {"jsonrpc": "2.0", "id": req_id, "result": {"resources": resources}}
     if method == "resources/read":
         uri = msg.get("params", {}).get("uri", "")
@@ -265,6 +284,8 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
                 "End of page."
             )
             return {"jsonrpc": "2.0", "id": req_id, "result": {"base64": False, "data": data}}
+        if TEST_MODE == 7 and uri == "remote://enabled":
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"base64": False, "data": "remote-access:true"}}
         return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "Only file:// supported"}}
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": "Method not found"}}
 
@@ -281,7 +302,6 @@ async def _rpc_endpoint(request: Request) -> JSONResponse:
     return JSONResponse(resp)
 
 
-# JSON-RPC endpoints: root and capability-derived variants
 app.post("/")(_rpc_endpoint)
 app.post("/rpc")(_rpc_endpoint)
 app.post("/rpc/message")(_rpc_endpoint)

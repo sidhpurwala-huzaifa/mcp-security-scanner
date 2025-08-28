@@ -642,6 +642,31 @@
       "fail_criteria": ["Any unauthenticated method access"],
       "remediation": ["Enforce OAuth and deny anonymous calls."],
       "references": ["MCP Authorization"]
+    },
+
+    {
+      "id": "RC-01",
+      "title": "Remote access control exposure",
+      "category": "access-control",
+      "severity": "critical",
+      "applies_to": ["remote-http", "local-stdio"],
+      "detect": "Server exposes tools that enable/disable remote access or open ports without strong authorization.",
+      "test": {
+        "type": "mcp",
+        "steps": [
+          "Parse tools/list for remote access control operations (e.g., remote_admin, port forward/expose).",
+          "Attempt to enable remote access unauthenticated and inspect response."
+        ]
+      },
+      "pass_criteria": [
+        "No remote access control tools exposed to clients",
+        "Such operations require admin scopes/HIL and are denied unauthenticated"
+      ],
+      "fail_criteria": ["Client can enable/disable remote access or open ports"],
+      "remediation": [
+        "Remove remote admin tooling from client surface; enforce RBAC and human-in-the-loop approvals."
+      ],
+      "references": ["Damn Vulnerable MCP Server: Challenge 9 solution"]
     }
   ],
   "enums": {
