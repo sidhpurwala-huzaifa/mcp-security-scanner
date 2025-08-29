@@ -35,7 +35,8 @@ def main() -> None:
 @click.option("--client-secret")
 @click.option("--scope")
 @click.option("--output", type=click.Path(dir_okay=False), help="Write report to file")
-def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain: bool, auth_type: Optional[str], auth_token: Optional[str], token_url: Optional[str], client_id: Optional[str], client_secret: Optional[str], scope: Optional[str], output: Optional[str]) -> None:
+@click.option("--timeout", type=float, default=12.0, show_default=True, help="Per-request read timeout in seconds")
+def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain: bool, auth_type: Optional[str], auth_token: Optional[str], token_url: Optional[str], client_id: Optional[str], client_secret: Optional[str], scope: Optional[str], output: Optional[str], timeout: float) -> None:
     if verbose and explain:
         console.print("--verbose and --explain are mutually exclusive; using --explain.")
         verbose = False
@@ -46,15 +47,15 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain: bo
     if not (url.lower().startswith("http://") or url.lower().startswith("https://")):
         raise click.ClickException("--url must start with http:// or https://")
     try:
-        with httpx.Client(follow_redirects=True, timeout=3.0) as _c:
-            _c.get(url)
+        with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout)) as _c:
+            _c.get(url, timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout))
     except httpx.RequestError as e:  # noqa: PERF203
         raise click.ClickException(f"Cannot reach MCP server at {url}: {type(e).__name__}: {e}")
 
     spec_file = Path(spec) if spec else Path(__file__).resolve().parents[2] / "scanner_specs.schema"
     spec_index = load_spec(spec_file)
 
-    findings = run_full_http_checks(url, spec_index, headers=auth_headers, trace=trace, verbose=verbose)
+    findings = run_full_http_checks(url, spec_index, headers=auth_headers, trace=trace, verbose=verbose, timeout=timeout)
     report = Report.new(target=url, findings=findings)
 
     if fmt == "json":
@@ -92,7 +93,8 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain: bo
 @click.option("--spec", type=click.Path(exists=True, dir_okay=False), help="Path to scanner_specs.schema")
 @click.option("--verbose", is_flag=True, default=False, help="Print full request/response trace and leaked data")
 @click.option("--explain", is_flag=True, default=False, help="Plain-English summary of sent/received/expected and exploited capability")
-def scan_range_cmd(host: str, ports: str, scheme: str, spec: Optional[str], verbose: bool, explain: bool) -> None:
+@click.option("--timeout", type=float, default=12.0, show_default=True, help="Per-request read timeout in seconds")
+def scan_range_cmd(host: str, ports: str, scheme: str, spec: Optional[str], verbose: bool, explain: bool, timeout: float) -> None:
     spec_file = spec
     if spec_file is None:
         spec_file = str(Path(__file__).resolve().parents[2] / "scanner_specs.schema")
@@ -111,7 +113,7 @@ def scan_range_cmd(host: str, ports: str, scheme: str, spec: Optional[str], verb
     for p in ports_list:
         trace: list[dict] = [] if (verbose or explain) else []
         base = f"{scheme}://{host}:{p}"
-        findings = run_full_http_checks(base, spec_index, trace=trace, verbose=verbose)
+        findings = run_full_http_checks(base, spec_index, trace=trace, verbose=verbose, timeout=timeout)
         passed = sum(1 for f in findings if f.passed)
         failed = sum(1 for f in findings if not f.passed)
         table.add_row(base, f"passed={passed} failed={failed}")

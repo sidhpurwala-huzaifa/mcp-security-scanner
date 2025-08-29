@@ -22,9 +22,13 @@ def _finding(spec: SpecCheck, passed: bool, details: str) -> Finding:
     )
 
 
-def scan_http_base(base_url: str, spec_index: Dict[str, SpecCheck], headers: Optional[Dict[str, str]] = None, trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False) -> List[Finding]:
+def scan_http_base(base_url: str, spec_index: Dict[str, SpecCheck], headers: Optional[Dict[str, str]] = None, trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False, timeout: float = 12.0) -> List[Finding]:
     findings: List[Finding] = []
-    client = httpx.Client(follow_redirects=True, timeout=5.0, headers=headers or {})
+    client = httpx.Client(
+        follow_redirects=True,
+        timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout),
+        headers=headers or {},
+    )
 
     # T-02 TLS enforcement & HSTS
     t02 = spec_index.get("T-02")
@@ -79,22 +83,38 @@ def scan_http_base(base_url: str, spec_index: Dict[str, SpecCheck], headers: Opt
     return findings
 
 
-def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], headers: Optional[Dict[str, str]] = None, trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False) -> List[Finding]:
+def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], headers: Optional[Dict[str, str]] = None, trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False, timeout: float = 12.0) -> List[Finding]:
     findings: List[Finding] = []
-    client = httpx.Client(follow_redirects=True, timeout=6.0, headers=headers or {})
+    client = httpx.Client(
+        follow_redirects=True,
+        timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout),
+        headers=headers or {},
+    )
 
     def _post_json(url: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
-        if verbose and trace is not None:
-            trace.append({"transport": "http", "direction": "send", "request": payload, "url": url})
-        r = client.post(url, json=payload)
-        status = r.status_code
-        try:
-            data = r.json()
-        except Exception:
-            data = r.text
-        if verbose and trace is not None:
-            trace.append({"transport": "http", "direction": "recv", "status": status, "data": data})
-        return status, data
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                if verbose and trace is not None:
+                    trace.append({"transport": "http", "direction": "send", "request": payload, "url": url, "attempt": attempt + 1})
+                r = client.post(url, json=payload)
+                status = r.status_code
+                try:
+                    data = r.json()
+                except Exception:
+                    data = r.text
+                if verbose and trace is not None:
+                    trace.append({"transport": "http", "direction": "recv", "status": status, "data": data, "attempt": attempt + 1})
+                return status, data
+            except httpx.ReadTimeout as e:  # type: ignore[attr-defined]
+                last_exc = e
+                if verbose and trace is not None:
+                    trace.append({"transport": "http", "direction": "error", "error": f"ReadTimeout on attempt {attempt + 1}"})
+                continue
+        # After retries, raise or return a structured error
+        if last_exc is not None:
+            return 599, {"error": f"ReadTimeout after retries: {last_exc}"}
+        return 598, {"error": "Unknown error without exception"}
 
     def _discover_endpoint() -> Tuple[Optional[str], Dict[str, Any]]:
         # 1) Try base URL and trailing slash for initialize
@@ -139,7 +159,7 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
 
     try:
         # T-02/T-01/KF-03
-        findings.extend(scan_http_base(base_url, spec_index, headers=headers, trace=trace, verbose=verbose))
+        findings.extend(scan_http_base(base_url, spec_index, headers=headers, trace=trace, verbose=verbose, timeout=timeout))
 
         # Endpoint discovery via initialize only
         msg_url_cache, init_obj = _discover_endpoint()
@@ -193,7 +213,7 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
                     bad_headers["Mcp-Session-Id"] = "tampered-session"
                 if verbose and trace is not None:
                     trace.append({"transport": "http", "direction": "send", "request": {"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}, "url": msg_url_cache, "note": "altered session id"})
-                bad = httpx.post(msg_url_cache, json={"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}, headers=bad_headers, timeout=6.0)
+                bad = client.post(msg_url_cache, json={"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}, headers=bad_headers)
                 rejects_bad = bad.status_code in (401, 403, 400)
                 findings.append(_finding(t03, passed=(sess_ok and rejects_bad), details=f"bad_status={bad.status_code}"))
             except Exception as e:
