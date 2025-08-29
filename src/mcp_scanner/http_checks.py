@@ -90,8 +90,16 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout),
         headers=headers or {},
     )
+    # Ensure required headers for Streamable HTTP compatibility
+    if "Accept" not in client.headers:
+        client.headers["Accept"] = "application/json, text/event-stream"
+    client.headers.setdefault("MCP-Protocol-Version", "2025-06-18")
+
+    # Cache discovered message URL and allow refresh from inner helpers
+    msg_url_cache: Optional[str] = None
 
     def _post_json(url: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
+        nonlocal msg_url_cache
         last_exc: Optional[Exception] = None
         for attempt in range(3):
             try:
@@ -105,6 +113,31 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
                     data = r.text
                 if verbose and trace is not None:
                     trace.append({"transport": "http", "direction": "recv", "status": status, "data": data, "attempt": attempt + 1})
+                # Detect session errors and try to refresh session once
+                if status in (400, 404):
+                    err_obj = data if isinstance(data, dict) else {}
+                    err_msg = ""
+                    if isinstance(err_obj, dict):
+                        e = err_obj.get("error")
+                        if isinstance(e, dict):
+                            err_msg = str(e.get("message") or "")
+                    if ("session" in err_msg.lower()) or ("session id" in err_msg.lower()):
+                        if verbose and trace is not None:
+                            trace.append({"transport": "http", "direction": "info", "note": "session missing/invalid; re-initializing"})
+                        # Re-discover endpoint and capture new session id
+                        new_url, _ = _discover_endpoint()
+                        if new_url is not None:
+                            msg_url_cache = new_url
+                            # Retry original request once immediately after refresh
+                            r2 = client.post(url, json=payload)
+                            status2 = r2.status_code
+                            try:
+                                data2 = r2.json()
+                            except Exception:
+                                data2 = r2.text
+                            if verbose and trace is not None:
+                                trace.append({"transport": "http", "direction": "recv", "status": status2, "data": data2, "note": "after re-init"})
+                            return status2, data2
                 return status, data
             except httpx.ReadTimeout as e:  # type: ignore[attr-defined]
                 last_exc = e
