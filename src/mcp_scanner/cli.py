@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Optional
 
@@ -59,8 +58,7 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain: bo
     report = Report.new(target=url, findings=findings)
 
     if fmt == "json":
-        data = report.model_dump()
-        out = json.dumps(data, indent=2)
+        out = report.model_dump_json(indent=2)
         if output:
             Path(output).write_text(out)
             console.print(f"Wrote JSON report to {output}")
