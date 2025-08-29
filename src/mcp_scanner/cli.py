@@ -28,6 +28,7 @@ def main() -> None:
 @click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
 @click.option("--verbose", is_flag=True, default=False, help="Print full request/response trace and leaked data")
 @click.option("--explain", is_flag=True, default=False, help="Plain-English summary of sent/received/expected and exploited capability")
+@click.option("--transport", type=click.Choice(["auto", "http", "sse"]), default="auto", show_default=True, help="Preferred transport hint; auto tries SSE when available")
 @click.option("--auth-type", type=click.Choice(["bearer", "oauth2-client-credentials"]))
 @click.option("--auth-token")
 @click.option("--token-url")
@@ -36,12 +37,15 @@ def main() -> None:
 @click.option("--scope")
 @click.option("--output", type=click.Path(dir_okay=False), help="Write report to file")
 @click.option("--timeout", type=float, default=12.0, show_default=True, help="Per-request read timeout in seconds")
-def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain: bool, auth_type: Optional[str], auth_token: Optional[str], token_url: Optional[str], client_id: Optional[str], client_secret: Optional[str], scope: Optional[str], output: Optional[str], timeout: float) -> None:
+@click.option("--session-id", help="Pre-supplied session id to include in Mcp-Session-Id header")
+def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain: bool, auth_type: Optional[str], auth_token: Optional[str], token_url: Optional[str], client_id: Optional[str], client_secret: Optional[str], scope: Optional[str], output: Optional[str], timeout: float, session_id: Optional[str], transport: str) -> None:
     if verbose and explain:
         console.print("--verbose and --explain are mutually exclusive; using --explain.")
         verbose = False
     trace: list[dict] = [] if (verbose or explain) else []
     auth_headers = build_auth_headers(auth_type, auth_token, token_url, client_id, client_secret, scope)
+    if session_id:
+        auth_headers = {**auth_headers, "Mcp-Session-Id": session_id}
 
     # Preflight reachability check
     if not (url.lower().startswith("http://") or url.lower().startswith("https://")):
@@ -55,7 +59,10 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain: bo
     spec_file = Path(spec) if spec else Path(__file__).resolve().parents[2] / "scanner_specs.schema"
     spec_index = load_spec(spec_file)
 
-    findings = run_full_http_checks(url, spec_index, headers=auth_headers, trace=trace, verbose=verbose, timeout=timeout)
+    # Transport hint is advisory; the checker auto-handles SSE vs JSON responses based on Content-Type
+    if transport == "sse" and "Accept" not in auth_headers:
+        auth_headers = {**auth_headers, "Accept": "application/json, text/event-stream"}
+    findings = run_full_http_checks(url, spec_index, headers=auth_headers, trace=trace, verbose=verbose, timeout=timeout, transport=transport)
     report = Report.new(target=url, findings=findings)
 
     if fmt == "json":
@@ -113,7 +120,7 @@ def scan_range_cmd(host: str, ports: str, scheme: str, spec: Optional[str], verb
     for p in ports_list:
         trace: list[dict] = [] if (verbose or explain) else []
         base = f"{scheme}://{host}:{p}"
-        findings = run_full_http_checks(base, spec_index, trace=trace, verbose=verbose, timeout=timeout)
+        findings = run_full_http_checks(base, spec_index, trace=trace, verbose=verbose, timeout=timeout, transport="auto")
         passed = sum(1 for f in findings if f.passed)
         failed = sum(1 for f in findings if not f.passed)
         table.add_row(base, f"passed={passed} failed={failed}")

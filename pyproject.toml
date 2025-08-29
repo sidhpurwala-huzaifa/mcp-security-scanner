@@ -3,7 +3,7 @@ name = "mcp-security-scanner"
 version = "0.1.0"
 description = "Security scanner for Model Context Protocol (MCP) servers"
 readme = "README.md"
-requires-python = ">=3.10"
+#requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [
   { name = "MCP Scanner", email = "huzaifas@redhat.com" }
