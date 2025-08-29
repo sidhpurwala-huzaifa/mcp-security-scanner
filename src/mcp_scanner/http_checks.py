@@ -117,16 +117,30 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         return 598, {"error": "Unknown error without exception"}
 
     def _discover_endpoint() -> Tuple[Optional[str], Dict[str, Any]]:
-        # 1) Try base URL and trailing slash for initialize
+        # 1) Try base URL and trailing slash for initialize; capture Mcp-Session-Id if provided
         init_payload = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
         for u in [base_url, base_url.rstrip("/") + "/"]:
             try:
-                status, data = _post_json(u, init_payload)
+                if verbose and trace is not None:
+                    trace.append({"transport": "http", "direction": "send", "request": init_payload, "url": u, "note": "initialize"})
+                r = client.post(u, json=init_payload)
+                try:
+                    data = r.json()
+                except Exception:
+                    data = r.text
+                if verbose and trace is not None:
+                    trace.append({"transport": "http", "direction": "recv", "status": r.status_code, "data": data, "headers": dict(r.headers)})
                 if isinstance(data, dict) and data.get("result"):
+                    # Capture session id if present and attach to client for subsequent requests
+                    sid = r.headers.get("Mcp-Session-Id")
+                    if isinstance(sid, str) and sid:
+                        client.headers["Mcp-Session-Id"] = sid
+                        if verbose and trace is not None:
+                            trace.append({"transport": "http", "direction": "info", "note": "session id set", "session_id": sid})
                     return u, data
             except Exception:
                 continue
-        # 2) If any worked (unlikely reached here), return None
+        # 2) If none worked, return None
         return None, {}
 
     def _refine_with_capabilities(curr_url: str, init_obj: Dict[str, Any]) -> str:
