@@ -65,7 +65,7 @@ def scan_http_base(base_url: str, spec_index: Dict[str, SpecCheck], headers: Opt
             details = f"error={type(e).__name__}:{e}"
         findings.append(_finding(t01, passed=passed, details=details))
 
-    # KF-03 Unsafe bind address (heuristic)
+    # KF-03 Unsafe bind address (heuristic) — treat as warn/info (local-only applicability)
     kf03 = spec_index.get("KF-03")
     if kf03:
         try:
@@ -75,10 +75,33 @@ def scan_http_base(base_url: str, spec_index: Dict[str, SpecCheck], headers: Opt
             r = client.get(sse_url)
             if verbose and trace is not None:
                 trace.append({"transport": "http", "direction": "recv", "status": r.status_code})
-            reachable = r.status_code < 500
-            findings.append(_finding(kf03, passed=not reachable, details=f"status={r.status_code}"))
+            # Do not fail remote/cluster targets on this heuristic; mark as informational warning
+            details = f"warn: local-only heuristic; status={r.status_code}"
+            findings.append(
+                Finding(
+                    id=kf03.id,
+                    title=kf03.title,
+                    category=kf03.category,
+                    severity=Severity.info,
+                    passed=True,
+                    details=details,
+                    remediation=kf03.remediation,
+                    references=kf03.references,
+                )
+            )
         except Exception as e:  # noqa: BLE001
-            findings.append(_finding(kf03, passed=True, details=f"error={type(e).__name__}:{e}"))
+            findings.append(
+                Finding(
+                    id=kf03.id,
+                    title=kf03.title,
+                    category=kf03.category,
+                    severity=Severity.info,
+                    passed=True,
+                    details=f"warn: local-only heuristic; error={type(e).__name__}:{e}",
+                    remediation=kf03.remediation,
+                    references=kf03.references,
+                )
+            )
 
     client.close()
     return findings

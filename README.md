@@ -116,6 +116,27 @@ mcp-scan scan \
   --explain
 ```
 
+### Transport, timeouts, and session
+- **--transport auto|http|sse**: Hint preferred transport. Auto will try HTTP first and fall back to SSE discovery when appropriate.
+- **--timeout <seconds>**: Per-request read timeout (connect/write/pool are bounded; default 12s). Increase if your server streams slowly.
+- **--session-id <SID>**: Use a pre-established session. The scanner will attach `Mcp-Session-Id: <SID>` to all requests.
+
+Examples:
+```bash
+# Force SSE and raise timeout
+mcp-scan scan --url https://your-mcp.example.com --transport sse --timeout 30 --verbose
+
+# Supply a known session id (when the server requires a session before initialize)
+mcp-scan scan --url https://your-mcp.example.com --session-id "e61fa6bd-8f7b-4588-a468-7e0d93dfa8bb" --format text
+
+# Auto transport (default) with longer timeout
+mcp-scan scan --url https://your-mcp.example.com --transport auto --timeout 25
+```
+
+Notes:
+- For servers exposing SSE at `/mcp/sse` or `/sse`, the scanner performs a handshake (GET with `Accept: text/event-stream`) and will parse an initial `endpoint` event. If the event contains a path like `/messages?sessionId=...`, the scanner extracts `sessionId`, sets `Mcp-Session-Id`, and uses the derived POST endpoint.
+- For cluster/remote deployments, the KF-03 (unsafe bind address) heuristic is treated as an informational warning only.
+
 ### How endpoint discovery works
 - The scanner starts discovery by posting `initialize` to the base URL (and its trailing slash variant).
 - It extracts capability strings that look like paths (beginning with `/`).
