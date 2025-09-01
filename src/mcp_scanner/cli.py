@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+import json
+from typing import Optional, Any, Dict, Iterator, List
 
 import click
 from rich.console import Console
@@ -9,7 +10,7 @@ from rich.table import Table
 
 from .models import Report
 from .spec import load_spec
-from .http_checks import run_full_http_checks, scan_http_base
+from .http_checks import run_full_http_checks, scan_http_base, get_server_health, rpc_call
 from .auth import build_auth_headers
 import httpx
 
@@ -27,8 +28,10 @@ def main() -> None:
 @click.option("--spec", type=click.Path(exists=True, dir_okay=False), help="Path to scanner_specs.schema")
 @click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
 @click.option("--verbose", is_flag=True, default=False, help="Print full request/response trace and leaked data")
-@click.option("--explain", is_flag=True, default=False, help="Plain-English summary of sent/received/expected and exploited capability")
+@click.option("--explain", "explain_id", help="Explain a specific finding by ID (e.g., X-01)")
 @click.option("--transport", type=click.Choice(["auto", "http", "sse"]), default="auto", show_default=True, help="Preferred transport hint; auto tries SSE when available")
+@click.option("--only-health", is_flag=True, default=False, help="Dump endpoints, tools, prompts, resources and exit (no scan)")
+@click.option("--sse-endpoint", help="When --transport sse, append this path to --url for SSE (e.g., /sse)")
 @click.option("--auth-type", type=click.Choice(["bearer", "oauth2-client-credentials"]))
 @click.option("--auth-token")
 @click.option("--token-url")
@@ -38,11 +41,62 @@ def main() -> None:
 @click.option("--output", type=click.Path(dir_okay=False), help="Write report to file")
 @click.option("--timeout", type=float, default=12.0, show_default=True, help="Per-request read timeout in seconds")
 @click.option("--session-id", help="Pre-supplied session id to include in Mcp-Session-Id header")
-def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain: bool, auth_type: Optional[str], auth_token: Optional[str], token_url: Optional[str], client_id: Optional[str], client_secret: Optional[str], scope: Optional[str], output: Optional[str], timeout: float, session_id: Optional[str], transport: str) -> None:
-    if verbose and explain:
+def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id: Optional[str], auth_type: Optional[str], auth_token: Optional[str], token_url: Optional[str], client_id: Optional[str], client_secret: Optional[str], scope: Optional[str], output: Optional[str], timeout: float, session_id: Optional[str], transport: str, only_health: bool, sse_endpoint: Optional[str]) -> None:
+    if verbose and explain_id:
         console.print("--verbose and --explain are mutually exclusive; using --explain.")
         verbose = False
-    trace: list[dict] = [] if (verbose or explain) else []
+    class RealtimeTrace:
+        def __init__(self, c: Console) -> None:
+            self._c = c
+            self._store: List[Dict[str, Any]] = []
+
+        def _truncate(self, value: str, limit: int = 500) -> str:
+            return value if len(value) <= limit else (value[:limit] + "...")
+
+        def append(self, entry: Dict[str, Any]) -> None:  # type: ignore[override]
+            self._store.append(entry)
+            direction = entry.get("direction")
+            note = entry.get("note")
+            if direction == "send":
+                if isinstance(entry.get("request"), dict):
+                    req = entry["request"]
+                    rpc_method = req.get("method")
+                    url_s = entry.get("url", "")
+                    body = self._truncate(json.dumps(req))
+                    line = f"Sent RPC {rpc_method} -> {url_s} body={body}"
+                else:
+                    method = entry.get("method", "")
+                    url_s = entry.get("url", "")
+                    hdrs = entry.get("headers")
+                    hstr = f" headers={hdrs}" if hdrs else ""
+                    line = f"Sent {method} {url_s}{hstr}"
+                if note:
+                    line += f" note={note}"
+                self._c.print(line)
+            elif direction == "recv":
+                status = entry.get("status")
+                data = entry.get("data")
+                if isinstance(data, (dict, list)):
+                    body = self._truncate(json.dumps(data))
+                elif isinstance(data, str):
+                    body = self._truncate(data)
+                else:
+                    body = self._truncate(str(entry.get("raw") or ""))
+                line = f"Received status={status} body={body}"
+                if note:
+                    line += f" note={note}"
+                self._c.print(line)
+            elif direction == "error":
+                self._c.print(f"Error: {entry.get('error')}")
+            elif direction == "info":
+                info = {k: v for k, v in entry.items() if k not in ("transport", "direction")}
+                self._c.print(f"Info: {info}")
+
+        def __iter__(self) -> Iterator[Dict[str, Any]]:
+            return iter(self._store)
+
+    # Collect a trace for explanation mode; use realtime only in verbose
+    trace: Any = RealtimeTrace(console) if verbose else ([] if explain_id else [])
     auth_headers = build_auth_headers(auth_type, auth_token, token_url, client_id, client_secret, scope)
     if session_id:
         auth_headers = {**auth_headers, "Mcp-Session-Id": session_id}
@@ -62,9 +116,67 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain: bo
     # Transport hint is advisory; the checker auto-handles SSE vs JSON responses based on Content-Type
     if transport == "sse" and "Accept" not in auth_headers:
         auth_headers = {**auth_headers, "Accept": "application/json, text/event-stream"}
-    findings = run_full_http_checks(url, spec_index, headers=auth_headers, trace=trace, verbose=verbose, timeout=timeout, transport=transport)
+    elif transport == "http" and "Accept" not in auth_headers:
+        auth_headers = {**auth_headers, "Accept": "application/json, text/event-stream"}
+    if only_health:
+        health = get_server_health(url, headers=auth_headers, trace=trace, verbose=verbose, timeout=timeout, transport=transport, sse_endpoint=sse_endpoint)
+        if fmt == "json":
+            console.rule("Health (JSON)")
+            console.print_json(json.dumps(health))
+            return
+        # Text output
+        console.rule("Health")
+        base = health.get("base_url")
+        msg_url = health.get("msg_url")
+        sse_url = health.get("sse_url")
+        init_obj = health.get("initialize") or {}
+        tools = health.get("tools") or []
+        prompts = health.get("prompts") or []
+        resources = health.get("resources") or []
+        console.print(f"Base URL: {base}")
+        console.print(f"Message endpoint: {msg_url}")
+        console.print(f"SSE URL: {sse_url}")
+        if isinstance(init_obj, dict):
+            keys = list((init_obj.get("result") or {}).keys()) if "result" in init_obj else list(init_obj.keys())
+            console.print(f"Initialize keys: {keys}")
+        # Tools table
+        ttable = Table(title="Tools")
+        ttable.add_column("Name")
+        ttable.add_column("Description")
+        if tools:
+            for t in tools:
+                ttable.add_row(str(t.get("name", "")), (t.get("description") or ""))
+        else:
+            ttable.add_row("-", "No tools discovered")
+        console.print(ttable)
+        # Prompts table
+        ptable = Table(title="Prompts")
+        ptable.add_column("Name")
+        ptable.add_column("Required")
+        if prompts:
+            for p in prompts:
+                req = ",".join(p.get("inputSchema", {}).get("required", []) if isinstance(p.get("inputSchema"), dict) else [])
+                ptable.add_row(str(p.get("name", "")), req)
+        else:
+            ptable.add_row("-", "No prompts discovered")
+        console.print(ptable)
+        # Resources table
+        rtable = Table(title="Resources")
+        rtable.add_column("Name")
+        rtable.add_column("URI")
+        rtable.add_column("Template")
+        if resources:
+            for r in resources:
+                rtable.add_row(str(r.get("name", "")), str(r.get("uri", "")), str(r.get("uriTemplate", "")))
+        else:
+            rtable.add_row("-", "No resources discovered", "")
+        console.print(rtable)
+        return
+    findings = run_full_http_checks(url, spec_index, headers=auth_headers, trace=trace, verbose=verbose, timeout=timeout, transport=transport, sse_endpoint=sse_endpoint)
     report = Report.new(target=url, findings=findings)
 
+    if only_health:
+        return
     if fmt == "json":
         out = report.model_dump_json(indent=2)
         if output:
@@ -83,14 +195,14 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain: bo
             table.add_row(f.id, f.title, f.severity.value, "✅" if f.passed else "❌", (f.details[:120] + "...") if len(f.details) > 120 else f.details)
         console.print(table)
         console.print(f"Summary: {report.summary}")
-        if verbose and trace:
-            console.rule("Trace")
-            for entry in trace:
-                console.print(entry)
-        if explain:
-            console.rule("Explanation")
-            for line in _explain_findings(report, trace):
-                console.print(f"- {line}")
+        if explain_id:
+            console.rule(f"Explanation for {explain_id}")
+            f = next((x for x in report.findings if x.id == explain_id), None)
+            if not f:
+                console.print(f"Finding {explain_id} not found in this report.")
+            else:
+                for line in _explain_single(f, spec_index, list(trace) if isinstance(trace, list) else []):
+                    console.print(f"- {line}")
 
 
 @main.command("scan-range")
@@ -130,73 +242,86 @@ def scan_range_cmd(host: str, ports: str, scheme: str, spec: Optional[str], verb
         console.print("Re-run single-target scan with --explain for detailed narrative.")
 
 
-def _explain_findings(report: Report, trace: list[dict]) -> list[str]:
-    explanations: list[str] = []
-    # index first send/recv by method for reference
-    first_send: dict[str, dict] = {}
-    first_recv: dict[str, dict] = {}
-    for entry in trace:
-        if entry.get("direction") == "send":
-            req = entry.get("request") or {}
-            method = req.get("method")
-            if method and method not in first_send:
-                first_send[method] = req
-        elif entry.get("direction") == "recv":
-            data = entry.get("data") or entry.get("raw")
-            # Cannot reliably map to method; store generically
-            if isinstance(data, dict):
-                method = data.get("result", {}).get("method") or data.get("method")
-                if method and method not in first_recv:
-                    first_recv[method] = data
-    for f in report.findings:
-        sent = ""
-        received = ""
-        expected = ""
-        exploited = f.title
-        if f.id == "A-01":
-            sent = "Called tools/list without auth"
-            received = "Server returned tool list"
-            expected = "401 or denial when unauthenticated"
-        elif f.id == "T-02":
-            sent = "Checked scheme"
-            received = f.details
-            expected = "HTTPS/WSS with HSTS"
-        elif f.id == "X-01":
-            sent = "Parsed tools/list and schemas"
-            received = "Found high-risk tool(s) lacking constraints" if not f.passed else "No risky unconstrained tools"
-            expected = "Destructive tools should be gated and constrained"
-        elif f.id == "P-02":
-            sent = "Scanned tool descriptions"
-            received = "Detected manipulative hidden instructions" if not f.passed else "No injection-style instructions"
-            expected = "Descriptions free of meta-instructions"
-        elif f.id == "X-03":
-            sent = "Listed tools twice"
-            received = "Descriptions/names changed between listings" if not f.passed else "No changes detected"
-            expected = "Stable, versioned tool metadata"
-        elif f.id == "R-01":
-            sent = "resources/read with ../../ path traversal"
-            received = "Traversal accepted" if not f.passed else "Traversal blocked"
-            expected = "Reject escaped/invalid URIs"
-        elif f.id == "R-03":
-            sent = "Listed resources and read sensitive URIs"
-            received = "Secrets or credentials present" if not f.passed else "No sensitive exposure"
-            expected = "Do not list/read internal credentials"
-        elif f.id == "R-04":
-            sent = "Probed uriTemplate with crafted values"
-            received = "Unconstrained template reflected/leaked data" if not f.passed else "Templates constrained/blocked"
-            expected = "Validate inputs and constrain templates"
-        elif f.id == "R-05":
-            sent = "Read private:// resources"
-            received = "Private data readable" if not f.passed else "Private namespaces not readable"
-            expected = "Enforce RBAC and hide private namespaces"
-        else:
-            sent = "Performed check"
-            received = "See details"
-            expected = "Per spec"
-        status = "FAILED" if not f.passed else "PASSED"
-        explanations.append(
-            f"{f.id} ({status}): Sent: {sent}. Received: {received}. Expected: {expected}. Exploited: {exploited}."
-        )
-    return explanations
+def _explain_single(finding, spec_index: Dict[str, Any], trace: list[dict]) -> list[str]:
+    lines: list[str] = []
+    spec = spec_index.get(finding.id)
+    test_name = f"{finding.id} - {finding.title}"
+    lines.append(f"Test: {test_name}")
+    # Expected outcome heuristics per ID
+    expected = "Per spec: server should enforce safe behavior."
+    if finding.id == "A-01":
+        expected = "Unauthenticated requests to tools/list should be denied (401/403)."
+    elif finding.id == "T-02":
+        expected = "Server should use HTTPS with proper transport security."
+    elif finding.id == "X-01":
+        expected = "Dangerous tools must be constrained and gated by validation."
+    elif finding.id == "P-02":
+        expected = "Tool descriptions should not contain manipulative/injection-style instructions."
+    elif finding.id == "X-03":
+        expected = "Tool descriptions/names should be stable between listings."
+    elif finding.id == "R-01":
+        expected = "Path traversal URIs must be rejected."
+    elif finding.id == "R-03":
+        expected = "Sensitive resources (credentials/secrets) must not be listed or readable."
+    elif finding.id == "R-04":
+        expected = "User-controlled uriTemplate inputs must be validated to prevent leakage."
+    elif finding.id == "R-05":
+        expected = "Private namespaces (private://) should not be readable."
+    elif finding.id == "P-03":
+        expected = "External resources must not trigger prompt injection when summarized."
+    elif finding.id == "A-03":
+        expected = "Server must not expose or pass through upstream access tokens."
+    elif finding.id == "RC-01":
+        expected = "Remote access controls must not be exposed/enabled without proper gates."
+    lines.append(f"Expected: {expected}")
+    # What scanner got
+    got = finding.details
+    lines.append(f"Got: {got}")
+    # Why fail/pass
+    if finding.passed:
+        lines.append("Result: PASS — behavior matches expected security posture.")
+    else:
+        lines.append("Result: FAIL — observed behavior violates the expected protection.")
+    # Remediation from spec
+    if getattr(spec, "remediation", None):
+        lines.append(f"Remediation: {spec.remediation}")
+    return lines
+
+
+@main.command("rpc")
+@click.option("--url", required=True, help="Target MCP server base URL (http:// or https://)")
+@click.option("--method", required=True, help="JSON-RPC method, e.g., tools/list")
+@click.option("--params", default="{}", help='JSON object for params, e.g., "{\"name\":\"tool\",\"arguments\":{}}"')
+@click.option("--header", multiple=True, help="Extra request headers, can repeat. Format: 'Key: Value'")
+@click.option("--transport", type=click.Choice(["auto", "http", "sse"]), default="auto")
+@click.option("--timeout", type=float, default=12.0)
+@click.option("--sse-endpoint", help="Explicit SSE path, e.g., /sse")
+@click.option("--session-id", help="Pre-supplied session id to include in Mcp-Session-Id header")
+@click.option("--verbose", is_flag=True, default=False)
+@click.option("--auth-type", type=click.Choice(["bearer", "oauth2-client-credentials"]))
+@click.option("--auth-token")
+@click.option("--token-url")
+@click.option("--client-id")
+@click.option("--client-secret")
+@click.option("--scope")
+def rpc_cmd(url: str, method: str, params: str, header: list[str], transport: str, timeout: float, sse_endpoint: Optional[str], session_id: Optional[str], verbose: bool, auth_type: Optional[str], auth_token: Optional[str], token_url: Optional[str], client_id: Optional[str], client_secret: Optional[str], scope: Optional[str]) -> None:
+    try:
+        params_obj = json.loads(params) if params else {}
+        if not isinstance(params_obj, dict):
+            raise ValueError("--params must be a JSON object")
+    except Exception as e:
+        raise click.ClickException(f"Invalid --params JSON: {e}")
+    headers: Dict[str, Any] = build_auth_headers(auth_type, auth_token, token_url, client_id, client_secret, scope)
+    if session_id:
+        headers = {**headers, "Mcp-Session-Id": session_id}
+    # Parse extra headers
+    for h in header or []:
+        if ":" not in h:
+            raise click.ClickException("--header must be in 'Key: Value' format")
+        k, v = h.split(":", 1)
+        headers[k.strip()] = v.strip()
+    trace: Any = []
+    result = rpc_call(url, method, params_obj, headers=headers, trace=trace, verbose=verbose, timeout=timeout, transport=transport, sse_endpoint=sse_endpoint)
+    console.print_json(json.dumps(result))
 
 

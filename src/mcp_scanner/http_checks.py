@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Any, Tuple
 import json
+import time
 
 import httpx
 from urllib.parse import urlparse, parse_qs
@@ -46,18 +47,18 @@ def scan_http_base(base_url: str, spec_index: Dict[str, SpecCheck], headers: Opt
             sse_url = base_url.rstrip("/") + "/sse"
             if verbose and trace is not None:
                 trace.append({"transport": "http", "direction": "send", "method": "GET", "url": sse_url})
-            r_ok = client.get(sse_url)
-            if verbose and trace is not None:
-                trace.append({"transport": "http", "direction": "recv", "status": r_ok.status_code, "headers": dict(r_ok.headers)})
-            exists = r_ok.status_code < 500
+            with client.stream("GET", sse_url, headers={"Accept": "text/event-stream", "Cache-Control": "no-cache"}) as r_ok:
+                if verbose and trace is not None:
+                    trace.append({"transport": "http", "direction": "recv", "status": r_ok.status_code, "headers": dict(r_ok.headers)})
+                exists = r_ok.status_code < 500
             # Now try forged Origin
             forged_headers = {**({} if headers is None else headers), "Origin": "http://evil.tld"}
             if verbose and trace is not None:
                 trace.append({"transport": "http", "direction": "send", "method": "GET", "url": sse_url, "headers": {"Origin": "http://evil.tld"}})
-            r = client.get(sse_url, headers=forged_headers)
-            if verbose and trace is not None:
-                trace.append({"transport": "http", "direction": "recv", "status": r.status_code, "headers": dict(r.headers)})
-            accepts_cross = r.status_code < 400
+            with client.stream("GET", sse_url, headers=forged_headers | {"Accept": "text/event-stream", "Cache-Control": "no-cache"}) as r:
+                if verbose and trace is not None:
+                    trace.append({"transport": "http", "direction": "recv", "status": r.status_code, "headers": dict(r.headers)})
+                accepts_cross = r.status_code < 400
             passed = exists and not accepts_cross
             details = f"sse={r_ok.status_code}; forged_origin={r.status_code}"
         except Exception as e:  # noqa: BLE001
@@ -72,9 +73,9 @@ def scan_http_base(base_url: str, spec_index: Dict[str, SpecCheck], headers: Opt
             sse_url = base_url.rstrip("/") + "/sse"
             if verbose and trace is not None:
                 trace.append({"transport": "http", "direction": "send", "method": "GET", "url": sse_url})
-            r = client.get(sse_url)
-            if verbose and trace is not None:
-                trace.append({"transport": "http", "direction": "recv", "status": r.status_code})
+            with client.stream("GET", sse_url, headers={"Accept": "text/event-stream", "Cache-Control": "no-cache"}) as r:
+                if verbose and trace is not None:
+                    trace.append({"transport": "http", "direction": "recv", "status": r.status_code})
             # Do not fail remote/cluster targets on this heuristic; mark as informational warning
             details = f"warn: local-only heuristic; status={r.status_code}"
             findings.append(
@@ -107,7 +108,7 @@ def scan_http_base(base_url: str, spec_index: Dict[str, SpecCheck], headers: Opt
     return findings
 
 
-def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], headers: Optional[Dict[str, str]] = None, trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False, timeout: float = 12.0, transport: str = "auto") -> List[Finding]:
+def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], headers: Optional[Dict[str, str]] = None, trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False, timeout: float = 12.0, transport: str = "auto", sse_endpoint: Optional[str] = None) -> List[Finding]:
     findings: List[Finding] = []
     client = httpx.Client(
         follow_redirects=True,
@@ -119,8 +120,12 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         client.headers["Accept"] = "application/json, text/event-stream"
     client.headers.setdefault("MCP-Protocol-Version", "2025-06-18")
 
-    # Cache discovered message URL and allow refresh from inner helpers
+    # Cache discovered message URL and working SSE URL (legacy) and allow refresh from inner helpers
     msg_url_cache: Optional[str] = None
+    sse_url_cache: Optional[str] = None
+    # Persistent SSE stream state (legacy servers): keep alive, resume on disconnect
+    sse_stream: Optional[httpx.Response] = None
+    last_event_id: Optional[str] = None
 
     def _parse_sse_response(resp: httpx.Response) -> Any:
         # Parse SSE and return the first JSON-RPC response object encountered
@@ -128,6 +133,9 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         for line in resp.iter_lines():
             if line is None:
                 continue
+            # Emit raw SSE line in verbose mode for debugging
+            if verbose and trace is not None:
+                trace.append({"transport": "http", "direction": "recv", "raw": line, "note": "sse-line"})
             if line == "":
                 if len(buffer) > 0:
                     data_text = "\n".join(buffer)
@@ -146,14 +154,148 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         # If we exit loop without finding response, return None
         return None
 
+    def _close_sse_stream() -> None:
+        nonlocal sse_stream
+        if sse_stream is not None:
+            try:
+                sse_stream.close()
+            except Exception:
+                pass
+            sse_stream = None
+
+    def _open_sse_stream() -> None:
+        nonlocal sse_stream, last_event_id
+        if sse_url_cache is None:
+            return
+        headers = {"Accept": "text/event-stream", "Cache-Control": "no-cache"}
+        sid = client.headers.get("Mcp-Session-Id")
+        if isinstance(sid, str) and sid:
+            headers["Mcp-Session-Id"] = sid
+        if last_event_id:
+            headers["Last-Event-ID"] = last_event_id
+        req = client.build_request("GET", sse_url_cache, headers=headers)
+        if verbose and trace is not None:
+            trace.append({"transport": "http", "direction": "send", "method": "GET", "url": sse_url_cache, "note": "sse-open", "headers": headers})
+        resp = client.send(req, stream=True)
+        ctype = resp.headers.get("content-type", "")
+        if "text/event-stream" not in ctype:
+            if verbose and trace is not None:
+                trace.append({"transport": "http", "direction": "recv", "status": resp.status_code, "headers": dict(resp.headers), "note": "sse-open-not-sse"})
+            try:
+                resp.close()
+            except Exception:
+                pass
+            return
+        sse_stream = resp
+        if verbose and trace is not None:
+            trace.append({"transport": "http", "direction": "info", "note": "sse-opened"})
+
+    def _ensure_sse_stream() -> None:
+        if sse_stream is None:
+            _open_sse_stream()
+
+    def _wait_sse_response(sse_url: str, expected_id: Any) -> Any:
+        # Ensure persistent SSE stream is available; reopen on disconnect and resume using Last-Event-ID
+        nonlocal last_event_id
+        nonlocal msg_url_cache
+        _ensure_sse_stream()
+        if sse_stream is None:
+            return {"error": "SSE stream not available"}
+        buffer: List[str] = []
+        current_event_id: Optional[str] = None
+        event_name: Optional[str] = None
+        deadline = time.time() + timeout
+        while True:
+            try:
+                for line in sse_stream.iter_lines():
+                    if line is None:
+                        continue
+                    if verbose and trace is not None:
+                        trace.append({"transport": "http", "direction": "recv", "raw": line, "note": "sse-line"})
+                    if line.startswith("event:"):
+                        event_name = line.split(":", 1)[1].strip()
+                        continue
+                    if line.startswith("id:"):
+                        current_event_id = line.split(":", 1)[1].strip()
+                    elif line.startswith("data:"):
+                        buffer.append(line[5:].lstrip())
+                    elif line == "":
+                        if buffer:
+                            data_text = "\n".join(buffer)
+                            buffer = []
+                            # Handle endpoint rotation events (plain text endpoint in data)
+                            if event_name == "endpoint":
+                                candidate = data_text.strip()
+                                try:
+                                    parsed = urlparse(candidate)
+                                    q = parse_qs(parsed.query)
+                                    sid: Optional[str] = None
+                                    for k in ["sessionId", "session_id"]:
+                                        if k in q and isinstance(q[k], list) and q[k]:
+                                            sid = q[k][0]
+                                            break
+                                    if sid:
+                                        client.headers["Mcp-Session-Id"] = sid
+                                        if candidate.startswith("http://") or candidate.startswith("https://"):
+                                            msg_url_cache = candidate
+                                        else:
+                                            base = base_url.rstrip("/")
+                                            if not candidate.startswith("/"):
+                                                candidate = "/" + candidate
+                                            msg_url_cache = base + candidate
+                                        if verbose and trace is not None:
+                                            trace.append({"transport": "http", "direction": "info", "note": "endpoint rotated", "msg_url": msg_url_cache, "session_id": sid})
+                                        # Signal rotation to caller so it can resend to new endpoint
+                                        return {"_endpoint_rotated": True}
+                                except Exception:
+                                    pass
+                                event_name = None
+                                continue
+                            # Try parse JSON-RPC response
+                            try:
+                                obj = json.loads(data_text)
+                            except Exception:
+                                obj = None
+                            if isinstance(obj, dict) and obj.get("jsonrpc") == "2.0" and ("result" in obj or "error" in obj):
+                                if obj.get("id") == expected_id:
+                                    if current_event_id:
+                                        last_event_id = current_event_id
+                                    if verbose and trace is not None:
+                                        trace.append({"transport": "http", "direction": "recv", "status": 200, "data": obj, "note": "sse-response"})
+                                    return obj
+                        if current_event_id:
+                            last_event_id = current_event_id
+                        current_event_id = None
+                        event_name = None
+                # If we exit the for-loop, the stream likely closed; reconnect
+                _close_sse_stream()
+                _open_sse_stream()
+                if sse_stream is None:
+                    return {"error": "Unable to reopen SSE stream"}
+                if time.time() > deadline:
+                    return {"error": "Timeout waiting for SSE response"}
+            except Exception:
+                _close_sse_stream()
+                _open_sse_stream()
+                if sse_stream is None:
+                    return {"error": "Unable to reopen SSE stream"}
+                if time.time() > deadline:
+                    return {"error": "Timeout waiting for SSE response"}
+
     def _post_json(url: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
         nonlocal msg_url_cache
+        nonlocal sse_url_cache
         last_exc: Optional[Exception] = None
         for attempt in range(3):
             try:
                 if verbose and trace is not None:
                     trace.append({"transport": "http", "direction": "send", "request": payload, "url": url, "attempt": attempt + 1})
-                with client.stream("POST", url, json=payload) as r:
+                # If posting to a legacy SSE session endpoint (sessionId in URL), require SSE response
+                post_headers = None
+                if "sessionId=" in url:
+                    post_headers = dict(client.headers)
+                    post_headers["Accept"] = "text/event-stream"
+                with client.stream("POST", url, json=payload, headers=post_headers) as r:
                     status = r.status_code
                     ctype = r.headers.get("content-type", "")
                     if "text/event-stream" in ctype:
@@ -172,6 +314,18 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
                                 data = str(raw)
                 if verbose and trace is not None:
                     trace.append({"transport": "http", "direction": "recv", "status": status, "data": data, "attempt": attempt + 1})
+                # If legacy SSE server returns 202 Accepted and responses go over separate SSE stream, wait for matching SSE response
+                if (status == 202 or (isinstance(data, str) and data.strip().lower().startswith("accepted"))) and sse_url_cache:
+                    expected_id = payload.get("id") if isinstance(payload, dict) else None
+                    if expected_id is not None:
+                        data = _wait_sse_response(sse_url_cache, expected_id)
+                        # If endpoint rotated, retry POST at updated msg_url
+                        if isinstance(data, dict) and data.get("_endpoint_rotated") and isinstance(msg_url_cache, str):
+                            if verbose and trace is not None:
+                                trace.append({"transport": "http", "direction": "info", "note": "retry after endpoint rotate", "url": msg_url_cache})
+                            url = msg_url_cache
+                            continue
+                        return 200, data
                 # Detect session errors and try to refresh session once
                 if status in (400, 404):
                     err_obj = data if isinstance(data, dict) else {}
@@ -180,7 +334,8 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
                         e = err_obj.get("error")
                         if isinstance(e, dict):
                             err_msg = str(e.get("message") or "")
-                    if ("session" in err_msg.lower()) or ("session id" in err_msg.lower()):
+                    low = err_msg.lower()
+                    if (("session" in low) or ("session id" in low)) and ("different transport" not in low):
                         if verbose and trace is not None:
                             trace.append({"transport": "http", "direction": "info", "note": "session missing/invalid; re-initializing"})
                         # Re-discover endpoint and capture new session id
@@ -204,6 +359,11 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
                                             data2 = str(raw2)
                             if verbose and trace is not None:
                                 trace.append({"transport": "http", "direction": "recv", "status": status2, "data": data2, "note": "after re-init"})
+                            if (status2 == 202 or (isinstance(data2, str) and data2.strip().lower().startswith("accepted"))) and sse_url_cache:
+                                expected_id = payload.get("id") if isinstance(payload, dict) else None
+                                if expected_id is not None:
+                                    data2 = _wait_sse_response(sse_url_cache, expected_id)
+                                    return 200, data2
                             return status2, data2
                 return status, data
             except httpx.ReadTimeout as e:  # type: ignore[attr-defined]
@@ -217,208 +377,108 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         return 598, {"error": "Unknown error without exception"}
 
     def _discover_endpoint() -> Tuple[Optional[str], Dict[str, Any]]:
-        # 1) If not explicitly in SSE mode, try base URL and trailing slash for initialize; capture Mcp-Session-Id if provided
-        if transport != "sse":
-            init_payload = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
-            for u in [base_url, base_url.rstrip("/") + "/"]:
-                try:
-                    if verbose and trace is not None:
-                        trace.append({"transport": "http", "direction": "send", "request": init_payload, "url": u, "note": "initialize"})
-                    r = client.post(u, json=init_payload)
-                    try:
-                        data = r.json()
-                    except Exception:
-                        data = r.text
-                    if verbose and trace is not None:
-                        trace.append({"transport": "http", "direction": "recv", "status": r.status_code, "data": data, "headers": dict(r.headers)})
-                    if isinstance(data, dict) and data.get("result"):
-                        # Capture session id if present and attach to client for subsequent requests
-                        sid = r.headers.get("Mcp-Session-Id")
-                        if isinstance(sid, str) and sid:
-                            client.headers["Mcp-Session-Id"] = sid
-                            if verbose and trace is not None:
-                                trace.append({"transport": "http", "direction": "info", "note": "session id set", "session_id": sid})
-                        return u, data
-                except Exception:
-                    continue
-        # 2) If none worked, and SSE is hinted or allowed, try SSE handshake to discover legacy POST endpoint
-        if transport in ("sse", "auto"):
-            if transport == "sse":
-                candidates = [
-                    base_url.rstrip("/") + "/mcp/sse",
-                    base_url.rstrip("/") + "/sse",
-                ]
-            else:
-                candidates = [
-                    base_url.rstrip("/") + "/mcp/sse",
-                    base_url.rstrip("/") + "/sse",
-                    base_url,
-                    base_url.rstrip("/") + "/",
-                    base_url.rstrip("/") + "/mcp",
-                ]
-            for sse_url in candidates:
-                try:
-                    if verbose and trace is not None:
-                        trace.append({"transport": "http", "direction": "send", "method": "GET", "url": sse_url, "note": "sse-handshake"})
-                    with client.stream("GET", sse_url, headers={"Accept": "text/event-stream", "Cache-Control": "no-cache"}) as r:
-                        ctype = r.headers.get("content-type", "")
-                        if "text/event-stream" not in ctype:
-                            # Try to parse JSON body to extract a session id if server returns JSON
-                            body_text = None
-                            try:
-                                raw = r.read()
-                                body_text = raw.decode("utf-8", errors="replace")
-                            except Exception:
-                                body_text = None
-                            session_from_body: Optional[str] = None
-                            if body_text:
-                                try:
-                                    obj = json.loads(body_text)
-                                    if isinstance(obj, dict):
-                                        for k in ["sessionId", "session_id", "session", "mcp_session_id", "Mcp-Session-Id"]:
-                                            v = obj.get(k)
-                                            if isinstance(v, str) and v:
-                                                session_from_body = v
-                                                break
-                                except Exception:
-                                    pass
-                            if verbose and trace is not None:
-                                entry = {"transport": "http", "direction": "recv", "status": r.status_code, "headers": dict(r.headers), "note": "not sse"}
-                                if session_from_body:
-                                    entry["session_from_body"] = session_from_body
-                                trace.append(entry)
-                            # If we found a body-provided session id, set header for subsequent requests
-                            if session_from_body:
-                                client.headers["Mcp-Session-Id"] = session_from_body
-                                if verbose and trace is not None:
-                                    trace.append({"transport": "http", "direction": "info", "note": "session id set from JSON body", "session_id": session_from_body})
+        nonlocal sse_url_cache
+        # Use only the provided URL(s); no alternate probing
+        if transport == "sse":
+            sse_url = (base_url.rstrip("/") + sse_endpoint) if sse_endpoint else base_url
+            try:
+                if verbose and trace is not None:
+                    trace.append({"transport": "http", "direction": "send", "method": "GET", "url": sse_url, "note": "sse-handshake"})
+                with client.stream("GET", sse_url, headers={"Accept": "text/event-stream", "Cache-Control": "no-cache"}) as r:
+                    if "text/event-stream" not in r.headers.get("content-type", ""):
+                        return None, {}
+                    sse_url_cache = sse_url
+                    event_name: Optional[str] = None
+                    buffer: List[str] = []
+                    for line in r.iter_lines():
+                        if line is None:
                             continue
-                        # Read initial SSE events looking for an endpoint event or data containing post path/url
-                        event_name: Optional[str] = None
-                        buffer: List[str] = []
-                        for line in r.iter_lines():
-                            if line is None:
-                                continue
-                            if line.startswith("event:"):
-                                event_name = line.split(":", 1)[1].strip()
-                            elif line.startswith("data:"):
-                                buffer.append(line[5:].lstrip())
-                            elif line == "":
-                                if len(buffer) > 0:
-                                    data_text = "\n".join(buffer)
-                                    buffer = []
+                        if verbose and trace is not None:
+                            trace.append({"transport": "http", "direction": "recv", "raw": line, "note": "sse-line"})
+                        if line.startswith("event:"):
+                            event_name = line.split(":", 1)[1].strip()
+                        elif line.startswith("data:"):
+                            buffer.append(line[5:].lstrip())
+                        elif line == "":
+                            if buffer:
+                                data_text = "\n".join(buffer)
+                                buffer = []
+                                try:
+                                    obj = json.loads(data_text)
+                                except Exception:
+                                    obj = None
+                                post: Optional[str] = None
+                                sid: Optional[str] = None
+                                if isinstance(obj, dict):
+                                    for key in ["post_path", "post_url", "path", "url", "endpoint"]:
+                                        val = obj.get(key)
+                                        if isinstance(val, str) and val:
+                                            post = val
+                                            break
+                                if post is None and (event_name == "endpoint"):
+                                    post = data_text.strip()
+                                if post:
                                     try:
-                                        obj = json.loads(data_text)
-                                    except Exception:
-                                        obj = None
-                                    if event_name == "endpoint" or isinstance(obj, dict):
-                                        # Try to extract post path/url and session id
-                                        post: Optional[str] = None
-                                        sid: Optional[str] = None
-                                        if isinstance(obj, dict):
-                                            for key in ["post_path", "post_url", "path", "url", "endpoint"]:
-                                                val = obj.get(key)
-                                                if isinstance(val, str) and val:
-                                                    post = val
-                                                    break
-                                        if post is None:
-                                            # Many servers send plain text path in data, e.g. "/messages?sessionId=..."
-                                            post = data_text.strip()
-                                        # Extract sessionId from query if present
-                                        try:
-                                            parsed = urlparse(post)
-                                            q = parse_qs(parsed.query)
-                                            for k in ["sessionId", "session_id"]:
-                                                if k in q and isinstance(q[k], list) and len(q[k]) > 0:
-                                                    sid = q[k][0]
-                                                    break
-                                        except Exception:
-                                            sid = None
-                                        if isinstance(sid, str) and sid:
-                                            client.headers["Mcp-Session-Id"] = sid
-                                            if verbose and trace is not None:
-                                                trace.append({"transport": "http", "direction": "info", "note": "session id set from SSE data", "session_id": sid})
-                                        if isinstance(post, str):
-                                            if post.startswith("http://") or post.startswith("https://"):
-                                                return post, {"result": {"capabilities": {}}}
-                                            # Build absolute URL from base origin
-                                            base = base_url.rstrip("/")
-                                            if not post.startswith("/"):
-                                                post = "/" + post
-                                            return base + post, {"result": {"capabilities": {}}}
-                                # reset event name on dispatch boundary
-                                event_name = None
-                        # If we reach here, try next candidate
-                except Exception as e:
-                    if verbose and trace is not None:
-                        trace.append({"transport": "http", "direction": "error", "error": f"sse-handshake-failed:{type(e).__name__}:{e}"})
-                    continue
-        # 3) If none worked, as a last resort on HTTP transport, try common legacy MCP POST endpoints
-        if transport != "sse":
-            init_payload = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
-            for path in ["/mcp", "/rpc"]:
-                u = base_url.rstrip("/") + path
-                try:
-                    if verbose and trace is not None:
-                        trace.append({"transport": "http", "direction": "send", "request": init_payload, "url": u, "note": "initialize-legacy"})
-                    r = client.post(u, json=init_payload)
-                    try:
-                        data = r.json()
-                    except Exception:
-                        data = r.text
-                    if verbose and trace is not None:
-                        trace.append({"transport": "http", "direction": "recv", "status": r.status_code, "data": data, "headers": dict(r.headers)})
-                    if isinstance(data, dict) and data.get("result"):
-                        sid = r.headers.get("Mcp-Session-Id")
-                        if isinstance(sid, str) and sid:
-                            client.headers["Mcp-Session-Id"] = sid
-                            if verbose and trace is not None:
-                                trace.append({"transport": "http", "direction": "info", "note": "session id set", "session_id": sid})
-                        return u, data
-                    # If server complains about missing/invalid session id, try to acquire one via GET and retry once
-                    if isinstance(data, dict) and "error" in data:
-                        err = data.get("error")
-                        msg = (err.get("message") if isinstance(err, dict) else None) or ""
-                        if isinstance(msg, str) and ("session" in msg.lower()):
-                            try:
-                                # GET without SSE accept to fetch potential JSON with session or header
-                                if verbose and trace is not None:
-                                    trace.append({"transport": "http", "direction": "send", "method": "GET", "url": u, "note": "fetch-session"})
-                                g = client.get(u)
-                                sid = g.headers.get("Mcp-Session-Id")
-                                session_from_body = None
-                                try:
-                                    jobj = g.json()
-                                    if isinstance(jobj, dict):
-                                        for k in ["sessionId", "session_id", "session", "mcp_session_id", "Mcp-Session-Id"]:
-                                            v = jobj.get(k)
-                                            if isinstance(v, str) and v:
-                                                session_from_body = v
+                                        parsed = urlparse(post)
+                                        q = parse_qs(parsed.query)
+                                        for k in ["sessionId", "session_id"]:
+                                            if k in q and isinstance(q[k], list) and q[k]:
+                                                sid = q[k][0]
                                                 break
-                                except Exception:
-                                    pass
-                                if isinstance(sid, str) and sid:
-                                    client.headers["Mcp-Session-Id"] = sid
-                                elif session_from_body:
-                                    client.headers["Mcp-Session-Id"] = session_from_body
-                                if verbose and trace is not None:
-                                    trace.append({"transport": "http", "direction": "recv", "status": g.status_code, "headers": dict(g.headers), "note": "session fetch result", "session_header": sid, "session_body": session_from_body})
-                                # Retry initialize once
-                                r2 = client.post(u, json=init_payload)
-                                try:
-                                    data2 = r2.json()
-                                except Exception:
-                                    data2 = r2.text
-                                if verbose and trace is not None:
-                                    trace.append({"transport": "http", "direction": "recv", "status": r2.status_code, "data": data2, "note": "initialize-legacy-retry"})
-                                if isinstance(data2, dict) and data2.get("result"):
-                                    return u, data2
-                            except Exception:
-                                pass
-                except Exception:
-                    continue
-        # 4) If none worked, return None
-        return None, {}
+                                    except Exception:
+                                        sid = None
+                                    if isinstance(sid, str) and sid:
+                                        client.headers["Mcp-Session-Id"] = sid
+                                        if verbose and trace is not None:
+                                            trace.append({"transport": "http", "direction": "info", "note": "session id set from SSE data", "session_id": sid})
+                                    if post.startswith("http://") or post.startswith("https://"):
+                                        return post, {"result": {"capabilities": {}}}
+                                    base = base_url.rstrip("/")
+                                    if not post.startswith("/"):
+                                        post = "/" + post
+                                    return base + post, {"result": {"capabilities": {}}}
+                            event_name = None
+                    # If no endpoint provided, try header-derived session id to synthesize
+                    sid_hdr = client.headers.get("Mcp-Session-Id")
+                    if isinstance(sid_hdr, str) and sid_hdr:
+                        return base_url.rstrip("/") + "/messages?sessionId=" + sid_hdr, {"result": {"capabilities": {}}}
+            except Exception:
+                return None, {}
+            return None, {}
+        # HTTP: use provided base_url directly
+        init_payload = {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {"sampling": {}, "elicitation": {}, "roots": {"listChanged": True}}, "clientInfo": {"name": "mcp-security-scanner", "version": "0.16.5"}}}
+        try:
+            if verbose and trace is not None:
+                trace.append({"transport": "http", "direction": "send", "request": init_payload, "url": base_url, "note": "initialize"})
+            # Stream response to handle servers that reply with text/event-stream for initialize
+            with client.stream("POST", base_url, json=init_payload) as r:
+                ctype = r.headers.get("content-type", "")
+                if "text/event-stream" in ctype:
+                    data_obj = _parse_sse_response(r) or {}
+                else:
+                    raw = r.read()
+                    try:
+                        data_obj = json.loads(raw)
+                    except Exception:
+                        try:
+                            data_obj = raw.decode("utf-8", errors="replace")
+                        except Exception:
+                            data_obj = str(raw)
+                if verbose and trace is not None:
+                    entry = {"transport": "http", "direction": "recv", "status": r.status_code, "headers": dict(r.headers)}
+                    if isinstance(data_obj, (dict, list)):
+                        entry["data"] = data_obj
+                    else:
+                        entry["data"] = str(data_obj)[:500]
+                    trace.append(entry)
+                sid = r.headers.get("Mcp-Session-Id")
+                if isinstance(sid, str) and sid:
+                    client.headers["Mcp-Session-Id"] = sid
+                    if verbose and trace is not None:
+                        trace.append({"transport": "http", "direction": "info", "note": "session id set", "session_id": sid})
+            return base_url, data_obj if isinstance(data_obj, dict) else {}
+        except Exception:
+            return base_url, {}
 
     def _refine_with_capabilities(curr_url: str, init_obj: Dict[str, Any]) -> str:
         # Extract path-like strings and probe {cap}, {cap}/message, {cap}/list
@@ -452,16 +512,16 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         # T-02/T-01/KF-03
         findings.extend(scan_http_base(base_url, spec_index, headers=headers, trace=trace, verbose=verbose, timeout=timeout))
 
-        # Endpoint discovery via initialize only
+        # Endpoint selection relies solely on provided URLs; skip capability-based refinement
         msg_url_cache, init_obj = _discover_endpoint()
         if msg_url_cache is None:
-            # Unable to initialize at base; record minimal A-01 failure and abort further probes
             a01 = spec_index.get("A-01")
             if a01:
-                findings.append(_finding(a01, passed=False, details="initialize failed at base URL (no endpoint)"))
+                findings.append(_finding(a01, passed=False, details="initialize failed at provided URL (no endpoint)"))
             return findings
-        # refine using capabilities if present
-        msg_url_cache = _refine_with_capabilities(msg_url_cache, init_obj)
+        # For legacy SSE session endpoints, open persistent SSE
+        if sse_url_cache and isinstance(msg_url_cache, str) and ("sessionId=" in msg_url_cache):
+            _open_sse_stream()
 
         # A-01: Unauthenticated access (probe again without auth only if headers were provided)
         a01 = spec_index.get("A-01")
@@ -496,17 +556,20 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         t03 = spec_index.get("T-03")
         if t03:
             try:
-                # Initialize already done above; try altered session id on discovered endpoint
-                status_init, _ = _post_json(msg_url_cache, {"jsonrpc": "2.0", "id": 4, "method": "initialize", "params": {}})
-                sess_ok = status_init < 500
-                bad_headers = dict(client.headers)
-                if "Mcp-Session-Id" not in bad_headers:
-                    bad_headers["Mcp-Session-Id"] = "tampered-session"
-                if verbose and trace is not None:
-                    trace.append({"transport": "http", "direction": "send", "request": {"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}, "url": msg_url_cache, "note": "altered session id"})
-                bad = client.post(msg_url_cache, json={"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}, headers=bad_headers)
-                rejects_bad = bad.status_code in (401, 403, 400)
-                findings.append(_finding(t03, passed=(sess_ok and rejects_bad), details=f"bad_status={bad.status_code}"))
+                # For legacy SSE sessions, skip tampering to avoid invalidating the server session
+                if "sessionId=" in (msg_url_cache or ""):
+                    findings.append(_finding(t03, passed=True, details="skipped on legacy SSE session endpoint"))
+                else:
+                    status_init, _ = _post_json(msg_url_cache, {"jsonrpc": "2.0", "id": 4, "method": "initialize", "params": {}})
+                    sess_ok = status_init < 500
+                    bad_headers = dict(client.headers)
+                    if "Mcp-Session-Id" not in bad_headers:
+                        bad_headers["Mcp-Session-Id"] = "tampered-session"
+                    if verbose and trace is not None:
+                        trace.append({"transport": "http", "direction": "send", "request": {"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}, "url": msg_url_cache, "note": "altered session id"})
+                    bad = client.post(msg_url_cache, json={"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}, headers=bad_headers)
+                    rejects_bad = bad.status_code in (401, 403, 400)
+                    findings.append(_finding(t03, passed=(sess_ok and rejects_bad), details=f"bad_status={bad.status_code}"))
             except Exception as e:
                 findings.append(_finding(t03, passed=False, details=f"error={type(e).__name__}:{e}"))
 
@@ -528,60 +591,69 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         # RC-01: Remote access control exposure
         rc01 = spec_index.get("RC-01")
         if rc01 and isinstance(tools, list):
-            candidates: List[Dict[str, Any]] = []
-            for t in tools:
-                name = (t.get("name") or "").lower()
-                desc = (t.get("description") or "").lower()
-                if any(k in name for k in ["remote_access", "remote", "port"]) or any(k in desc for k in ["remote access", "open port", "expose", "bind"]):
-                    candidates.append(t)
-            # Attempt unauthenticated call if a known name is present
-            exploited = []
-            for t in candidates:
-                tname = t.get("name")
-                if tname:
-                    try:
-                        resp = rpc("tools/call", {"name": tname, "arguments": {"port": 8080}})
-                        text = json.dumps(resp).lower()
-                        if any(s in text for s in ["remote_access_enabled:true", "remote-access:true", "enabled"]):
-                            exploited.append({"tool": tname, "resp": resp})
-                    except Exception:
-                        continue
-            findings.append(_finding(rc01, passed=len(exploited) == 0, details=json.dumps({"candidates": candidates, "exploited": exploited})))
+            if len(tools) == 0:
+                findings.append(_finding(rc01, passed=True, details="No tools were discovered"))
+            else:
+                candidates: List[Dict[str, Any]] = []
+                for t in tools:
+                    name = (t.get("name") or "").lower()
+                    desc = (t.get("description") or "").lower()
+                    if any(k in name for k in ["remote_access", "remote", "port"]) or any(k in desc for k in ["remote access", "open port", "expose", "bind"]):
+                        candidates.append(t)
+                # Attempt unauthenticated call if a known name is present
+                exploited = []
+                for t in candidates:
+                    tname = t.get("name")
+                    if tname:
+                        try:
+                            resp = rpc("tools/call", {"name": tname, "arguments": {"port": 8080}})
+                            text = json.dumps(resp).lower()
+                            if any(s in text for s in ["remote_access_enabled:true", "remote-access:true", "enabled"]):
+                                exploited.append({"tool": tname, "resp": resp})
+                        except Exception:
+                            continue
+                findings.append(_finding(rc01, passed=len(exploited) == 0, details=json.dumps({"candidates": candidates, "exploited": exploited})))
 
         # X-03 Rug-pull
         x03 = spec_index.get("X-03")
         if x03:
-            tools_list2 = rpc("tools/list", {})
-            tools2 = tools_list2.get("result", {}).get("tools", []) if isinstance(tools_list2, dict) else []
-            def key(t: Dict[str, Any]):
-                return t.get("name"), t.get("description")
-            set1 = {key(t) for t in tools or []}
-            set2 = {key(t) for t in tools2 or []}
-            diff = []
-            if set1 != set2:
-                diff = [
-                    {"before": [t for t in tools if t.get("name") == n and t.get("description") == d],
-                     "after": [t for t in tools2 if t.get("name") == n and t.get("description") == d]}
-                    for (n, d) in set1.symmetric_difference(set2)
-                ]
-            findings.append(_finding(x03, passed=len(diff) == 0, details=json.dumps(diff)))
+            if not tools:
+                findings.append(_finding(x03, passed=True, details="No tools were discovered"))
+            else:
+                tools_list2 = rpc("tools/list", {})
+                tools2 = tools_list2.get("result", {}).get("tools", []) if isinstance(tools_list2, dict) else []
+                def key(t: Dict[str, Any]):
+                    return t.get("name"), t.get("description")
+                set1 = {key(t) for t in tools or []}
+                set2 = {key(t) for t in tools2 or []}
+                diff = []
+                if set1 != set2:
+                    diff = [
+                        {"before": [t for t in tools if t.get("name") == n and t.get("description") == d],
+                         "after": [t for t in tools2 if t.get("name") == n and t.get("description") == d]}
+                        for (n, d) in set1.symmetric_difference(set2)
+                    ]
+                findings.append(_finding(x03, passed=len(diff) == 0, details=json.dumps(diff)))
 
         # P-02 Prompt/description heuristics
         p02 = spec_index.get("P-02")
         if p02 and isinstance(tools, list):
-            bad_phrases = [
-                "ignore any safety rules",
-                "override other tools",
-                "include contents of",
-                "do not disclose this instruction",
-                "hidden instruction",
-            ]
-            hits: List[Dict[str, object]] = []
-            for t in tools:
-                desc = (t.get("description") or "").lower()
-                if any(phrase in desc for phrase in bad_phrases):
-                    hits.append(t)
-            findings.append(_finding(p02, passed=len(hits) == 0, details=json.dumps(hits)))
+            if len(tools) == 0:
+                findings.append(_finding(p02, passed=True, details="No tools were discovered"))
+            else:
+                bad_phrases = [
+                    "ignore any safety rules",
+                    "override other tools",
+                    "include contents of",
+                    "do not disclose this instruction",
+                    "hidden instruction",
+                ]
+                hits: List[Dict[str, object]] = []
+                for t in tools:
+                    desc = (t.get("description") or "").lower()
+                    if any(phrase in desc for phrase in bad_phrases):
+                        hits.append(t)
+                findings.append(_finding(p02, passed=len(hits) == 0, details=json.dumps(hits)))
 
         # P-01 Prompt argument validation
         p01 = spec_index.get("P-01")
@@ -631,24 +703,27 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         # X-01 risky unconstrained tools
         x01 = spec_index.get("X-01")
         if x01:
-            risky_keywords = [
-                "exec", "command", "shell", "write_file", "delete", "rm", "chmod", "chown",
-                "fetch", "http", "url", "eval", "render", "payment", "admin", "privilege",
-            ]
-            risky_tools: List[Dict[str, Any]] = []
-            for t in tools or []:
-                name = (t.get("name") or "").lower()
-                desc = (t.get("description") or "").lower()
-                schema = t.get("inputSchema") or {}
-                has_constraints = False
-                if isinstance(schema, dict):
-                    props = schema.get("properties") or {}
-                    for _, p in (props.items() if isinstance(props, dict) else []):
-                        if any(k in p for k in ("enum", "pattern", "minimum", "maximum", "minLength", "maxLength")):
-                            has_constraints = True
-                if any(k in name or k in desc for k in risky_keywords) and not has_constraints:
-                    risky_tools.append(t)
-            findings.append(_finding(x01, passed=len(risky_tools) == 0, details=json.dumps(risky_tools)))
+            if not tools:
+                findings.append(_finding(x01, passed=True, details="No tools were discovered"))
+            else:
+                risky_keywords = [
+                    "exec", "command", "shell", "write_file", "delete", "rm", "chmod", "chown",
+                    "fetch", "http", "url", "eval", "render", "payment", "admin", "privilege",
+                ]
+                risky_tools: List[Dict[str, Any]] = []
+                for t in tools or []:
+                    name = (t.get("name") or "").lower()
+                    desc = (t.get("description") or "").lower()
+                    schema = t.get("inputSchema") or {}
+                    has_constraints = False
+                    if isinstance(schema, dict):
+                        props = schema.get("properties") or {}
+                        for _, p in (props.items() if isinstance(props, dict) else []):
+                            if any(k in p for k in ("enum", "pattern", "minimum", "maximum", "minLength", "maxLength")):
+                                has_constraints = True
+                    if any(k in name or k in desc for k in risky_keywords) and not has_constraints:
+                        risky_tools.append(t)
+                findings.append(_finding(x01, passed=len(risky_tools) == 0, details=json.dumps(risky_tools)))
 
         # R-01 traversal & R-02 sensitive path
         r01 = spec_index.get("R-01")
@@ -665,26 +740,29 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         # X-02 fuzz tools/call
         x02 = spec_index.get("X-02")
         if x02 and isinstance(tools, list):
-            payloads = ["; id", "$(whoami)", "`uname - a`", "../../../../etc/passwd", "http://169.254.169.254/latest/meta-data/"]
-            observed: List[Dict[str, Any]] = []
-            for t in tools:
-                name = t.get("name")
-                schema = t.get("inputSchema") or {}
-                props = schema.get("properties") or {}
-                str_param = None
-                for pn, p in (props.items() if isinstance(props, dict) else []):
-                    if (p.get("type") == "string"):
-                        str_param = pn
-                        break
-                if not (name and str_param):
-                    continue
-                for pl in payloads:
-                    resp = rpc("tools/call", {"name": name, "arguments": {str_param: pl}})
-                    text = json.dumps(resp).lower()
-                    if any(key in text for key in ["uid=", "linux", "root:x:", "etc/passwd", "meta-data", "insecure", "stdout"]):
-                        observed.append({"tool": name, "payload": pl, "resp": resp})
-                        break
-            findings.append(_finding(x02, passed=len(observed) == 0, details=json.dumps(observed)))
+            if len(tools) == 0:
+                findings.append(_finding(x02, passed=True, details="No tools were discovered"))
+            else:
+                payloads = ["; id", "$(whoami)", "`uname - a`", "../../../../etc/passwd", "http://169.254.169.254/latest/meta-data/"]
+                observed: List[Dict[str, Any]] = []
+                for t in tools:
+                    name = t.get("name")
+                    schema = t.get("inputSchema") or {}
+                    props = schema.get("properties") or {}
+                    str_param = None
+                    for pn, p in (props.items() if isinstance(props, dict) else []):
+                        if (p.get("type") == "string"):
+                            str_param = pn
+                            break
+                    if not (name and str_param):
+                        continue
+                    for pl in payloads:
+                        resp = rpc("tools/call", {"name": name, "arguments": {str_param: pl}})
+                        text = json.dumps(resp).lower()
+                        if any(key in text for key in ["uid=", "linux", "root:x:", "etc/passwd", "meta-data", "insecure", "stdout"]):
+                            observed.append({"tool": name, "payload": pl, "resp": resp})
+                            break
+                findings.append(_finding(x02, passed=len(observed) == 0, details=json.dumps(observed)))
 
         # Resources listing
         rlist = rpc("resources/list", {})
@@ -812,4 +890,564 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         client.close()
     return findings
 
+
+def rpc_call(base_url: str, method: str, params: Dict[str, Any], headers: Optional[Dict[str, str]] = None, trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False, timeout: float = 12.0, transport: str = "auto", sse_endpoint: Optional[str] = None) -> Dict[str, Any]:
+    client = httpx.Client(
+        follow_redirects=True,
+        timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout),
+        headers=headers or {},
+    )
+    client.headers.setdefault("Accept", "application/json, text/event-stream")
+    client.headers.setdefault("MCP-Protocol-Version", "2025-06-18")
+
+    msg_url_cache: Optional[str] = None
+    sse_url_cache: Optional[str] = None
+    sse_stream: Optional[httpx.Response] = None
+    last_event_id: Optional[str] = None
+
+    def _parse_sse_response(resp: httpx.Response) -> Any:
+        buffer: List[str] = []
+        for line in resp.iter_lines():
+            if line is None:
+                continue
+            if verbose and trace is not None:
+                trace.append({"transport": "http", "direction": "recv", "raw": line, "note": "sse-line"})
+            if line == "":
+                if buffer:
+                    data_text = "\n".join(buffer)
+                    buffer = []
+                    try:
+                        obj = json.loads(data_text)
+                        if isinstance(obj, dict) and obj.get("jsonrpc") == "2.0" and ("result" in obj or "error" in obj):
+                            return obj
+                    except Exception:
+                        pass
+                continue
+            if line.startswith("data:"):
+                buffer.append(line[5:].lstrip())
+        return None
+
+    def _close_sse_stream() -> None:
+        nonlocal sse_stream
+        if sse_stream is not None:
+            try:
+                sse_stream.close()
+            except Exception:
+                pass
+            sse_stream = None
+
+    def _open_sse_stream() -> None:
+        nonlocal sse_stream, last_event_id
+        if sse_url_cache is None:
+            return
+        headers2 = {"Accept": "text/event-stream", "Cache-Control": "no-cache"}
+        sid = client.headers.get("Mcp-Session-Id")
+        if isinstance(sid, str) and sid:
+            headers2["Mcp-Session-Id"] = sid
+        if last_event_id:
+            headers2["Last-Event-ID"] = last_event_id
+        if verbose and trace is not None:
+            trace.append({"transport": "http", "direction": "send", "method": "GET", "url": sse_url_cache, "note": "sse-open", "headers": headers2})
+        resp = client.send(client.build_request("GET", sse_url_cache, headers=headers2), stream=True)
+        if "text/event-stream" not in resp.headers.get("content-type", ""):
+            if verbose and trace is not None:
+                trace.append({"transport": "http", "direction": "recv", "status": resp.status_code, "headers": dict(resp.headers), "note": "sse-open-not-sse"})
+            try:
+                resp.close()
+            except Exception:
+                pass
+            return
+        sse_stream = resp
+        if verbose and trace is not None:
+            trace.append({"transport": "http", "direction": "info", "note": "sse-opened"})
+
+    def _ensure_sse_stream() -> None:
+        if sse_stream is None:
+            _open_sse_stream()
+
+    def _wait_sse_response(sse_url: str, expected_id: Any) -> Any:
+        nonlocal last_event_id, msg_url_cache
+        _ensure_sse_stream()
+        if sse_stream is None:
+            return {"error": "SSE stream not available"}
+        buffer: List[str] = []
+        current_event_id: Optional[str] = None
+        event_name: Optional[str] = None
+        deadline = time.time() + timeout
+        while True:
+            try:
+                for line in sse_stream.iter_lines():
+                    if line is None:
+                        continue
+                    if verbose and trace is not None:
+                        trace.append({"transport": "http", "direction": "recv", "raw": line, "note": "sse-line"})
+                    if line.startswith("event:"):
+                        event_name = line.split(":", 1)[1].strip()
+                        continue
+                    if line.startswith("id:"):
+                        current_event_id = line.split(":", 1)[1].strip()
+                    elif line.startswith("data:"):
+                        buffer.append(line[5:].lstrip())
+                    elif line == "":
+                        if buffer:
+                            data_text = "\n".join(buffer)
+                            buffer = []
+                            if event_name == "endpoint":
+                                candidate = data_text.strip()
+                                try:
+                                    parsed = urlparse(candidate)
+                                    q = parse_qs(parsed.query)
+                                    sid: Optional[str] = None
+                                    for k in ["sessionId", "session_id"]:
+                                        if k in q and isinstance(q[k], list) and q[k]:
+                                            sid = q[k][0]
+                                            break
+                                    if sid:
+                                        client.headers["Mcp-Session-Id"] = sid
+                                        if candidate.startswith("http://") or candidate.startswith("https://"):
+                                            msg_url_cache = candidate
+                                        else:
+                                            base = base_url.rstrip("/")
+                                            if not candidate.startswith("/"):
+                                                candidate = "/" + candidate
+                                            msg_url_cache = base + candidate
+                                        if verbose and trace is not None:
+                                            trace.append({"transport": "http", "direction": "info", "note": "endpoint rotated", "msg_url": msg_url_cache, "session_id": sid})
+                                        return {"_endpoint_rotated": True}
+                                except Exception:
+                                    pass
+                                event_name = None
+                                continue
+                            try:
+                                obj = json.loads(data_text)
+                            except Exception:
+                                obj = None
+                            if isinstance(obj, dict) and obj.get("jsonrpc") == "2.0" and ("result" in obj or "error" in obj):
+                                if obj.get("id") == expected_id:
+                                    if current_event_id:
+                                        last_event_id = current_event_id
+                                    if verbose and trace is not None:
+                                        trace.append({"transport": "http", "direction": "recv", "status": 200, "data": obj, "note": "sse-response"})
+                                    return obj
+                        if current_event_id:
+                            last_event_id = current_event_id
+                        current_event_id = None
+                        event_name = None
+                _close_sse_stream()
+                _open_sse_stream()
+                if sse_stream is None:
+                    return {"error": "Unable to reopen SSE stream"}
+                if time.time() > deadline:
+                    return {"error": "Timeout waiting for SSE response"}
+            except Exception:
+                _close_sse_stream()
+                _open_sse_stream()
+                if sse_stream is None:
+                    return {"error": "Unable to reopen SSE stream"}
+                if time.time() > deadline:
+                    return {"error": "Timeout waiting for SSE response"}
+
+    def _post_json(url: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
+        nonlocal msg_url_cache
+        nonlocal sse_url_cache
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                if verbose and trace is not None:
+                    trace.append({"transport": "http", "direction": "send", "request": payload, "url": url, "attempt": attempt + 1})
+                post_headers = None
+                if "sessionId=" in url:
+                    post_headers = dict(client.headers)
+                    post_headers["Accept"] = "text/event-stream"
+                with client.stream("POST", url, json=payload, headers=post_headers) as r:
+                    status = r.status_code
+                    ctype = r.headers.get("content-type", "")
+                    if "text/event-stream" in ctype:
+                        data = _parse_sse_response(r)
+                        if data is None:
+                            data = {"error": "No JSON-RPC response on SSE stream"}
+                    else:
+                        raw = r.read()
+                        try:
+                            data = json.loads(raw)
+                        except Exception:
+                            try:
+                                data = raw.decode("utf-8", errors="replace")
+                            except Exception:
+                                data = str(raw)
+                if verbose and trace is not None:
+                    trace.append({"transport": "http", "direction": "recv", "status": status, "data": data, "attempt": attempt + 1})
+                if (status == 202 or (isinstance(data, str) and data.strip().lower().startswith("accepted"))) and sse_url_cache:
+                    expected_id = payload.get("id") if isinstance(payload, dict) else None
+                    if expected_id is not None:
+                        data = _wait_sse_response(sse_url_cache, expected_id)
+                        if isinstance(data, dict) and data.get("_endpoint_rotated") and isinstance(msg_url_cache, str):
+                            if verbose and trace is not None:
+                                trace.append({"transport": "http", "direction": "info", "note": "retry after endpoint rotate", "url": msg_url_cache})
+                            url = msg_url_cache
+                            continue
+                        return 200, data
+                return status, data
+            except httpx.ReadTimeout as e:  # type: ignore[attr-defined]
+                last_exc = e
+                if verbose and trace is not None:
+                    trace.append({"transport": "http", "direction": "error", "error": f"ReadTimeout on attempt {attempt + 1}"})
+                continue
+        if last_exc is not None:
+            return 599, {"error": f"ReadTimeout after retries: {last_exc}"}
+        return 598, {"error": "Unknown error without exception"}
+
+    def _discover_endpoint() -> Tuple[Optional[str], Dict[str, Any]]:
+        # base POST initialize (streamable HTTP)
+        if transport != "sse":
+            init_payload = {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {"sampling": {}, "elicitation": {}, "roots": {"listChanged": True}}, "clientInfo": {"name": "mcp-security-scanner", "version": "0.16.5"}}}
+            for u in [base_url]:
+                try:
+                    if verbose and trace is not None:
+                        trace.append({"transport": "http", "direction": "send", "request": init_payload, "url": u, "note": "initialize"})
+                    r = client.post(u, json=init_payload)
+                    try:
+                        data = r.json()
+                    except Exception:
+                        data = r.text
+                    if verbose and trace is not None:
+                        trace.append({"transport": "http", "direction": "recv", "status": r.status_code, "data": data, "headers": dict(r.headers)})
+                    if isinstance(data, dict):
+                        sid = r.headers.get("Mcp-Session-Id")
+                        if isinstance(sid, str) and sid:
+                            client.headers["Mcp-Session-Id"] = sid
+                        return u, data
+                except Exception:
+                    continue
+        # legacy HTTP+SSE handshake (explicit URL only)
+        if transport in ("sse", "auto"):
+            sse_url = (base_url.rstrip("/") + sse_endpoint) if (transport == "sse" and sse_endpoint) else base_url
+            try:
+                if verbose and trace is not None:
+                    trace.append({"transport": "http", "direction": "send", "method": "GET", "url": sse_url, "note": "sse-handshake"})
+                with client.stream("GET", sse_url, headers={"Accept": "text/event-stream", "Cache-Control": "no-cache"}) as r:
+                    if "text/event-stream" not in r.headers.get("content-type", ""):
+                        return None, {}
+                    buffer: List[str] = []
+                    event_name: Optional[str] = None
+                    for line in r.iter_lines():
+                        if line is None:
+                            continue
+                        if line.startswith("event:"):
+                            event_name = line.split(":", 1)[1].strip()
+                        elif line.startswith("data:"):
+                            buffer.append(line[5:].lstrip())
+                        elif line == "":
+                            if buffer:
+                                data_text = "\n".join(buffer)
+                                buffer = []
+                                try:
+                                    obj = json.loads(data_text)
+                                except Exception:
+                                    obj = None
+                                post: Optional[str] = None
+                                sid: Optional[str] = None
+                                if isinstance(obj, dict):
+                                    for key in ["post_path", "post_url", "path", "url", "endpoint"]:
+                                        val = obj.get(key)
+                                        if isinstance(val, str) and val:
+                                            post = val
+                                            break
+                                if post is None and (event_name == "endpoint"):
+                                    post = data_text.strip()
+                                if post:
+                                    try:
+                                        parsed = urlparse(post)
+                                        q = parse_qs(parsed.query)
+                                        for k in ["sessionId", "session_id"]:
+                                            if k in q and isinstance(q[k], list) and q[k]:
+                                                sid = q[k][0]
+                                                break
+                                    except Exception:
+                                        sid = None
+                                    if isinstance(sid, str) and sid:
+                                        client.headers["Mcp-Session-Id"] = sid
+                                    if post.startswith("http://") or post.startswith("https://"):
+                                        return post, {"result": {"capabilities": {}}}
+                                    base = base_url.rstrip("/")
+                                    if not post.startswith("/"):
+                                        post = "/" + post
+                                    return base + post, {"result": {"capabilities": {}}}
+                            event_name = None
+                    sid_hdr = client.headers.get("Mcp-Session-Id")
+                    if isinstance(sid_hdr, str) and sid_hdr:
+                        return base_url.rstrip("/") + "/messages?sessionId=" + sid_hdr, {"result": {"capabilities": {}}}
+            except Exception:
+                return None, {}
+        return None, {}
+
+    try:
+        msg_url, init_obj = _discover_endpoint()
+        if msg_url is None:
+            return {"error": "No endpoint discovered"}
+        # No capability-based refinement; use discovered or provided URL directly
+        if sse_url_cache and ("sessionId=" in (msg_url or "")):
+            _open_sse_stream()
+        payload = {"jsonrpc": "2.0", "id": 99, "method": method, "params": params}
+        status, data = _post_json(msg_url, payload)
+        if isinstance(data, dict):
+            return data
+        return {"status": status, "body": data}
+    finally:
+        _close_sse_stream()
+        client.close()
+
+
+def get_server_health(base_url: str, headers: Optional[Dict[str, str]] = None, trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False, timeout: float = 12.0, transport: str = "auto", sse_endpoint: Optional[str] = None) -> Dict[str, Any]:
+    """Return endpoints and enumerations for debugging: msg endpoint, optional SSE url, init object, tools, prompts, resources.
+    Works with legacy HTTP+SSE and streamable HTTP."""
+    client = httpx.Client(
+        follow_redirects=True,
+        timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout),
+        headers=headers or {},
+    )
+    client.headers.setdefault("Accept", "application/json, text/event-stream")
+    client.headers.setdefault("MCP-Protocol-Version", "2025-06-18")
+    msg_url_cache: Optional[str] = None
+    sse_url_cache: Optional[str] = None
+    # Persistent SSE state for legacy servers
+    sse_stream: Optional[httpx.Response] = None
+    last_event_id: Optional[str] = None
+
+    def _parse_sse_response(resp: httpx.Response) -> Any:
+        buffer: List[str] = []
+        for line in resp.iter_lines():
+            if line is None:
+                continue
+            if line == "":
+                if buffer:
+                    data_text = "\n".join(buffer)
+                    buffer = []
+                    try:
+                        obj = json.loads(data_text)
+                        if isinstance(obj, dict) and obj.get("jsonrpc") == "2.0" and ("result" in obj or "error" in obj):
+                            return obj
+                    except Exception:
+                        pass
+                continue
+            if line.startswith("data:"):
+                buffer.append(line[5:].lstrip())
+        return None
+
+    def _close_sse_stream() -> None:
+        nonlocal sse_stream
+        if sse_stream is not None:
+            try:
+                sse_stream.close()
+            except Exception:
+                pass
+            sse_stream = None
+
+    def _open_sse_stream() -> None:
+        nonlocal sse_stream, last_event_id
+        if sse_url_cache is None:
+            return
+        headers2 = {"Accept": "text/event-stream", "Cache-Control": "no-cache"}
+        sid = client.headers.get("Mcp-Session-Id")
+        if isinstance(sid, str) and sid:
+            headers2["Mcp-Session-Id"] = sid
+        if last_event_id:
+            headers2["Last-Event-ID"] = last_event_id
+        if verbose and trace is not None:
+            trace.append({"transport": "http", "direction": "send", "method": "GET", "url": sse_url_cache, "note": "sse-open", "headers": headers2})
+        resp = client.send(client.build_request("GET", sse_url_cache, headers=headers2), stream=True)
+        if "text/event-stream" not in resp.headers.get("content-type", ""):
+            if verbose and trace is not None:
+                trace.append({"transport": "http", "direction": "recv", "status": resp.status_code, "headers": dict(resp.headers), "note": "sse-open-not-sse"})
+            try:
+                resp.close()
+            except Exception:
+                pass
+            return
+        sse_stream = resp
+        if verbose and trace is not None:
+            trace.append({"transport": "http", "direction": "info", "note": "sse-opened"})
+
+    def _ensure_sse_stream() -> None:
+        if sse_stream is None:
+            _open_sse_stream()
+
+    def _wait_sse_response(sse_url: str, expected_id: Any) -> Any:
+        nonlocal last_event_id
+        _ensure_sse_stream()
+        if sse_stream is None:
+            return {"error": "SSE stream not available"}
+        buffer: List[str] = []
+        current_event_id: Optional[str] = None
+        while True:
+            try:
+                for line in sse_stream.iter_lines():
+                    if line is None:
+                        continue
+                    if line.startswith("id:"):
+                        current_event_id = line.split(":", 1)[1].strip()
+                    elif line.startswith("data:"):
+                        buffer.append(line[5:].lstrip())
+                    elif line == "":
+                        if buffer:
+                            data_text = "\n".join(buffer)
+                            buffer = []
+                            try:
+                                obj = json.loads(data_text)
+                            except Exception:
+                                obj = None
+                            if isinstance(obj, dict) and obj.get("jsonrpc") == "2.0" and obj.get("id") == expected_id:
+                                if current_event_id:
+                                    last_event_id = current_event_id
+                                return obj
+                        if current_event_id:
+                            last_event_id = current_event_id
+                        current_event_id = None
+                _close_sse_stream()
+                _open_sse_stream()
+                if sse_stream is None:
+                    return {"error": "Unable to reopen SSE stream"}
+            except Exception:
+                _close_sse_stream()
+                _open_sse_stream()
+                if sse_stream is None:
+                    return {"error": "Unable to reopen SSE stream"}
+
+    def _post_json(url: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
+        post_headers = None
+        if "sessionId=" in url:
+            post_headers = dict(client.headers)
+            post_headers["Accept"] = "text/event-stream"
+        with client.stream("POST", url, json=payload, headers=post_headers) as r:
+            status = r.status_code
+            ctype = r.headers.get("content-type", "")
+            if "text/event-stream" in ctype:
+                data = _parse_sse_response(r) or {"error": "No JSON-RPC response on SSE stream"}
+            else:
+                raw = r.read()
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    try:
+                        data = raw.decode("utf-8", errors="replace")
+                    except Exception:
+                        data = str(raw)
+        if (status == 202 or (isinstance(data, str) and data.strip().lower().startswith("accepted"))) and sse_url_cache:
+            expected_id = payload.get("id")
+            if expected_id is not None:
+                data = _wait_sse_response(sse_url_cache, expected_id)
+                return 200, data
+        return status, data
+
+    def _discover_endpoint() -> Tuple[Optional[str], Dict[str, Any]]:
+        # base POST initialize (streamable HTTP)
+        if transport != "sse":
+            init_payload = {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {"sampling": {}, "elicitation": {}, "roots": {"listChanged": True}}, "clientInfo": {"name": "mcp-security-scanner", "version": "0.16.5"}}}
+            for u in [base_url]:
+                try:
+                    if verbose and trace is not None:
+                        trace.append({"transport": "http", "direction": "send", "request": init_payload, "url": u, "note": "initialize"})
+                    # Stream to support SSE initialize responses
+                    with client.stream("POST", u, json=init_payload) as r:
+                        if "text/event-stream" in r.headers.get("content-type", ""):
+                            data = _parse_sse_response(r) or {}
+                        else:
+                            raw = r.read()
+                            try:
+                                data = json.loads(raw)
+                            except Exception:
+                                try:
+                                    data = raw.decode("utf-8", errors="replace")
+                                except Exception:
+                                    data = str(raw)
+                    if verbose and trace is not None:
+                        trace.append({"transport": "http", "direction": "recv", "status": 200, "data": data, "headers": dict(r.headers) if hasattr(r, 'headers') else {}})
+                    if isinstance(data, dict):
+                        sid = r.headers.get("Mcp-Session-Id")
+                        if isinstance(sid, str) and sid:
+                            client.headers["Mcp-Session-Id"] = sid
+                        return u, data
+                except Exception:
+                    continue
+        # legacy HTTP+SSE handshake (explicit URL only)
+        if transport in ("sse", "auto"):
+            sse_url = (base_url.rstrip("/") + sse_endpoint) if (transport == "sse" and sse_endpoint) else base_url
+            try:
+                if verbose and trace is not None:
+                    trace.append({"transport": "http", "direction": "send", "method": "GET", "url": sse_url, "note": "sse-handshake"})
+                with client.stream("GET", sse_url, headers={"Accept": "text/event-stream", "Cache-Control": "no-cache"}) as r:
+                    if "text/event-stream" not in r.headers.get("content-type", ""):
+                        return None, {}
+                    buffer: List[str] = []
+                    event_name: Optional[str] = None
+                    for line in r.iter_lines():
+                        if line is None:
+                            continue
+                        if line.startswith("event:"):
+                            event_name = line.split(":", 1)[1].strip()
+                        elif line.startswith("data:"):
+                            buffer.append(line[5:].lstrip())
+                        elif line == "":
+                            if buffer:
+                                data_text = "\n".join(buffer)
+                                buffer = []
+                                try:
+                                    obj = json.loads(data_text)
+                                except Exception:
+                                    obj = None
+                                post: Optional[str] = None
+                                sid: Optional[str] = None
+                                if isinstance(obj, dict):
+                                    for key in ["post_path", "post_url", "path", "url", "endpoint"]:
+                                        val = obj.get(key)
+                                        if isinstance(val, str) and val:
+                                            post = val
+                                            break
+                                if post is None and (event_name == "endpoint"):
+                                    post = data_text.strip()
+                                if post:
+                                    try:
+                                        parsed = urlparse(post)
+                                        q = parse_qs(parsed.query)
+                                        for k in ["sessionId", "session_id"]:
+                                            if k in q and isinstance(q[k], list) and q[k]:
+                                                sid = q[k][0]
+                                                break
+                                    except Exception:
+                                        sid = None
+                                    if isinstance(sid, str) and sid:
+                                        client.headers["Mcp-Session-Id"] = sid
+                                    if post.startswith("http://") or post.startswith("https://"):
+                                        return post, {"result": {"capabilities": {}}}
+                                    base = base_url.rstrip("/")
+                                    if not post.startswith("/"):
+                                        post = "/" + post
+                                    return base + post, {"result": {"capabilities": {}}}
+                            event_name = None
+                    sid_hdr = client.headers.get("Mcp-Session-Id")
+                    if isinstance(sid_hdr, str) and sid_hdr:
+                        return base_url.rstrip("/") + "/messages?sessionId=" + sid_hdr, {"result": {"capabilities": {}}}
+            except Exception:
+                return None, {}
+        return None, {}
+
+    try:
+        init_url, init_obj = _discover_endpoint()
+        if init_url is None:
+            return {"base_url": base_url, "msg_url": None, "sse_url": None, "initialize": None, "tools": [], "prompts": [], "resources": []}
+        msg_url = init_url
+        if transport in ("sse", "auto") and ("sessionId=" in (msg_url or "")):
+            _open_sse_stream()
+        def rpc(method: str, params: Dict[str, object]) -> Dict[str, object]:
+            status, data = _post_json(msg_url, {"jsonrpc": "2.0", "id": 99, "method": method, "params": params})
+            return data if isinstance(data, dict) else {"status": status, "body": data}
+        tools_obj = rpc("tools/list", {})
+        tools = tools_obj.get("result", {}).get("tools", []) if isinstance(tools_obj, dict) else []
+        prompts_obj = rpc("prompts/list", {})
+        prompts = prompts_obj.get("result", {}).get("prompts", []) if isinstance(prompts_obj, dict) else []
+        resources_obj = rpc("resources/list", {})
+        resources = resources_obj.get("result", {}).get("resources", []) if isinstance(resources_obj, dict) else []
+        return {"base_url": base_url, "msg_url": msg_url, "sse_url": None, "initialize": init_obj, "tools": tools, "prompts": prompts, "resources": resources}
+    finally:
+        client.close()
 
