@@ -139,8 +139,6 @@ mcp-scan scan \
 - Initialize returns SSE: handled transparently; the response body is parsed from the stream.
 - Cannot reach server: verify host/port and TLS. Use `--timeout` for long responses.
 
-```
-
 ## Acknowledgements
 - Vulnerability ideas inspired by `Damn Vulnerable MCP Server` - https://github.com/harishsg993010/damn-vulnerable-MCP-server
 - Ye Wang from Red Hat for all his help in resolving `init` problems with certain MCP servers
