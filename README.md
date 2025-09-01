@@ -1,8 +1,8 @@
-MCP Security Scanner (HTTP & SSE)
+MCP Security Scanner
 
-This is a Python-based security scanner for Model Context Protocol (MCP) servers. It supports Streamable HTTP and SSE transports, runs a suite of checks mapped to `scanner_specs.schema` (auth, transport, tools, prompts, resources), and includes a deliberately insecure MCP-like server for testing.
+This is a Python-based penetration testing tool for Model Context Protocol (MCP) servers. It supports Streamable HTTP and SSE transports, runs a suite of checks mapped to `scanner_specs.schema` (auth, transport, tools, prompts, resources), and includes a deliberately insecure MCP-like server for testing.
 
-Note: SSE transport is discontinued in the latest version of MCP. Support for SSE in this tool is purely experimental and may not work!!!
+**Note: SSE transport is discontinued in the latest version of MCP. Support for SSE in this tool is purely experimental and may not work!!!**
 
 
 ## Install
@@ -38,7 +38,7 @@ mcp-scan scan --url http://127.0.0.1:65000
 
 ### Run insecure test server (HTTP)
 ```bash
-# Basic (HTTP JSON-RPC). Supports --test modes (see below)
+# Basic (HTTP JSON-RPC). Supports --test modes (Defaults to 0, otherwise choose a vulnerable model from below)
 insecure-mcp-server --host 127.0.0.1 --port 9001
 
 # Test modes currently supported
@@ -50,6 +50,7 @@ insecure-mcp-server --host 127.0.0.1 --port 9001
 # --test 5: token theft (server leaks upstream access tokens to clients)
 # --test 6: indirect prompt injection (external resource carries hidden instructions)
 # --test 7: remote access control exposure (unauth tool enables remote access)
+
 insecure-mcp-server --host 127.0.0.1 --port 9001 --test 0/1/2/3/4/5/6/7
 ```
 
@@ -131,13 +132,7 @@ mcp-scan scan \
 - **--transport auto|http|sse**: Hint preferred transport; no dynamic discovery. Provide working URLs.
 - **--timeout <seconds>**: Per-request read timeout (default 12s). Increase for slow streams.
 - **--session-id <SID>**: Pre-established session (`Mcp-Session-Id` header).
-- Content negotiation: scanner sends `Accept: application/json, text/event-stream` to support streamable responses.
 
-### Troubleshooting
-- 406 Not Acceptable: the scanner now advertises both JSON and SSE in `Accept`.
-- SSE responds with `endpoint` then rotates session: the scanner updates the POST URL and `Mcp-Session-Id` automatically.
-- Initialize returns SSE: handled transparently; the response body is parsed from the stream.
-- Cannot reach server: verify host/port and TLS. Use `--timeout` for long responses.
 
 ## Acknowledgements
 - Vulnerability ideas inspired by `Damn Vulnerable MCP Server` - https://github.com/harishsg993010/damn-vulnerable-MCP-server
