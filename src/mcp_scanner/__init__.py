@@ -1,7 +1,7 @@
 __all__ = [
-    "scan_server",
+    "__version__",
 ]
 
-from .scanner import scan_server  # noqa: E402
+__version__ = "0.1.1"
 
 

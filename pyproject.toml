@@ -1,6 +1,6 @@
 [project]
 name = "mcp-security-scanner"
-version = "0.1.0"
+version = "0.1.3"
 description = "Security scanner for Model Context Protocol (MCP) servers"
 readme = "README.md"
 #requires-python = ">=3.10"
@@ -26,6 +26,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["mcp_scanner*", "insecure_mcp_server*"]
+
+[tool.setuptools.package-data]
+"mcp_scanner" = ["scanner_specs.schema"]
 
 [project.scripts]
 mcp-scan = "mcp_scanner.cli:main"

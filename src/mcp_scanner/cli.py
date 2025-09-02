@@ -45,6 +45,8 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
     if verbose and explain_id:
         console.print("--verbose and --explain are mutually exclusive; using --explain.")
         verbose = False
+    if transport == "sse":
+        console.print("SSE is deprecated in MCP!!! SSE support in the scanner is experimental and may not work!!!")
     class RealtimeTrace:
         def __init__(self, c: Console) -> None:
             self._c = c
@@ -110,8 +112,11 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
     except httpx.RequestError as e:  # noqa: PERF203
         raise click.ClickException(f"Cannot reach MCP server at {url}: {type(e).__name__}: {e}")
 
-    spec_file = Path(spec) if spec else Path(__file__).resolve().parents[2] / "scanner_specs.schema"
-    spec_index = load_spec(spec_file)
+    spec_file = Path(spec) if spec else None
+    if spec_file is not None:
+        spec_index = load_spec(spec_file)
+    else:
+        spec_index = load_spec()
 
     # Transport hint is advisory; the checker auto-handles SSE vs JSON responses based on Content-Type
     if transport == "sse" and "Accept" not in auth_headers:
@@ -216,8 +221,9 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
 def scan_range_cmd(host: str, ports: str, scheme: str, spec: Optional[str], verbose: bool, explain: bool, timeout: float) -> None:
     spec_file = spec
     if spec_file is None:
-        spec_file = str(Path(__file__).resolve().parents[2] / "scanner_specs.schema")
-    spec_index = load_spec(Path(spec_file))
+        spec_index = load_spec()
+    else:
+        spec_index = load_spec(Path(spec_file))
     ports_list: list[int] = []
     for part in ports.split(","):
         if "-" in part:
@@ -311,6 +317,8 @@ def rpc_cmd(url: str, method: str, params: str, header: list[str], transport: st
             raise ValueError("--params must be a JSON object")
     except Exception as e:
         raise click.ClickException(f"Invalid --params JSON: {e}")
+    if transport == "sse":
+        console.print("SSE is deprecated in MCP!!! SSE support in the scanner is experimental and may not work!!!")
     headers: Dict[str, Any] = build_auth_headers(auth_type, auth_token, token_url, client_id, client_secret, scope)
     if session_id:
         headers = {**headers, "Mcp-Session-Id": session_id}

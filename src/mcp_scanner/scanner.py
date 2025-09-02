@@ -252,8 +252,7 @@ async def run_checks_ws(uri: str, spec_index: Dict[str, SpecCheck], trace: Optio
 
 
 def scan_server(uri: str, spec_path: str | None = None, verbose: bool = False, trace: Optional[List[Dict[str, Any]]] = None) -> Report:
-    spec_file = Path(spec_path) if spec_path else Path(__file__).resolve().parents[2] / "scanner_specs.schema"
-    spec_index = load_spec(spec_file)
+    spec_index = load_spec(Path(spec_path)) if spec_path else load_spec()
     findings = asyncio.run(run_checks_ws(uri, spec_index, trace=trace, verbose=verbose))
     return Report.new(target=uri, findings=findings)
 
