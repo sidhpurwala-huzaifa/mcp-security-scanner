@@ -11,6 +11,7 @@ from rich.table import Table
 from .models import Report
 from .spec import load_spec
 from .http_checks import run_full_http_checks, scan_http_base, get_server_health, rpc_call
+from .stdio_checks import run_full_stdio_checks, get_server_health_stdio, rpc_call_stdio
 from .auth import build_auth_headers
 import httpx
 
@@ -29,9 +30,10 @@ def main() -> None:
 @click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
 @click.option("--verbose", is_flag=True, default=False, help="Print full request/response trace and leaked data")
 @click.option("--explain", "explain_id", help="Explain a specific finding by ID (e.g., X-01)")
-@click.option("--transport", type=click.Choice(["auto", "http", "sse"]), default="auto", show_default=True, help="Preferred transport hint; auto tries SSE when available")
+@click.option("--transport", type=click.Choice(["auto", "http", "sse", "stdio"]), default="auto", show_default=True, help="Preferred transport hint; auto tries SSE when available")
 @click.option("--only-health", is_flag=True, default=False, help="Dump endpoints, tools, prompts, resources and exit (no scan)")
 @click.option("--sse-endpoint", help="When --transport sse, append this path to --url for SSE (e.g., /sse)")
+@click.option("--stdio-cmd", multiple=True, help="When --transport stdio, command to launch server (e.g., --stdio-cmd node --stdio-cmd build/index.js)")
 @click.option("--auth-type", type=click.Choice(["bearer", "oauth2-client-credentials"]))
 @click.option("--auth-token")
 @click.option("--token-url")
@@ -41,7 +43,7 @@ def main() -> None:
 @click.option("--output", type=click.Path(dir_okay=False), help="Write report to file")
 @click.option("--timeout", type=float, default=12.0, show_default=True, help="Per-request read timeout in seconds")
 @click.option("--session-id", help="Pre-supplied session id to include in Mcp-Session-Id header")
-def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id: Optional[str], auth_type: Optional[str], auth_token: Optional[str], token_url: Optional[str], client_id: Optional[str], client_secret: Optional[str], scope: Optional[str], output: Optional[str], timeout: float, session_id: Optional[str], transport: str, only_health: bool, sse_endpoint: Optional[str]) -> None:
+def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id: Optional[str], auth_type: Optional[str], auth_token: Optional[str], token_url: Optional[str], client_id: Optional[str], client_secret: Optional[str], scope: Optional[str], output: Optional[str], timeout: float, session_id: Optional[str], transport: str, only_health: bool, sse_endpoint: Optional[str], stdio_cmd: List[str]) -> None:
     if verbose and explain_id:
         console.print("--verbose and --explain are mutually exclusive; using --explain.")
         verbose = False
@@ -103,14 +105,15 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
     if session_id:
         auth_headers = {**auth_headers, "Mcp-Session-Id": session_id}
 
-    # Preflight reachability check
-    if not (url.lower().startswith("http://") or url.lower().startswith("https://")):
-        raise click.ClickException("--url must start with http:// or https://")
-    try:
-        with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout)) as _c:
-            _c.get(url, timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout))
-    except httpx.RequestError as e:  # noqa: PERF203
-        raise click.ClickException(f"Cannot reach MCP server at {url}: {type(e).__name__}: {e}")
+    # Preflight reachability check (HTTP/SSE only)
+    if transport in ("http", "auto", "sse"):
+        if not (url.lower().startswith("http://") or url.lower().startswith("https://")):
+            raise click.ClickException("--url must start with http:// or https:// for http/sse transport")
+        try:
+            with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout)) as _c:
+                _c.get(url, timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout))
+        except httpx.RequestError as e:  # noqa: PERF203
+            raise click.ClickException(f"Cannot reach MCP server at {url}: {type(e).__name__}: {e}")
 
     spec_file = Path(spec) if spec else None
     if spec_file is not None:
@@ -124,7 +127,12 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
     elif transport == "http" and "Accept" not in auth_headers:
         auth_headers = {**auth_headers, "Accept": "application/json, text/event-stream"}
     if only_health:
-        health = get_server_health(url, headers=auth_headers, trace=trace, verbose=verbose, timeout=timeout, transport=transport, sse_endpoint=sse_endpoint)
+        if transport == "stdio":
+            if not stdio_cmd:
+                raise click.ClickException("--stdio-cmd is required when --transport stdio")
+            health = get_server_health_stdio(list(stdio_cmd))
+        else:
+            health = get_server_health(url, headers=auth_headers, trace=trace, verbose=verbose, timeout=timeout, transport=transport, sse_endpoint=sse_endpoint)
         if fmt == "json":
             console.rule("Health (JSON)")
             console.print_json(json.dumps(health))
@@ -177,7 +185,12 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
             rtable.add_row("-", "No resources discovered", "")
         console.print(rtable)
         return
-    findings = run_full_http_checks(url, spec_index, headers=auth_headers, trace=trace, verbose=verbose, timeout=timeout, transport=transport, sse_endpoint=sse_endpoint)
+    if transport == "stdio":
+        if not stdio_cmd:
+            raise click.ClickException("--stdio-cmd is required when --transport stdio")
+        findings = run_full_stdio_checks(list(stdio_cmd), spec_index, trace=trace, verbose=verbose)
+    else:
+        findings = run_full_http_checks(url, spec_index, headers=auth_headers, trace=trace, verbose=verbose, timeout=timeout, transport=transport, sse_endpoint=sse_endpoint)
     report = Report.new(target=url, findings=findings)
 
     if only_health:
@@ -299,9 +312,10 @@ def _explain_single(finding, spec_index: Dict[str, Any], trace: list[dict]) -> l
 @click.option("--method", required=True, help="JSON-RPC method, e.g., tools/list")
 @click.option("--params", default="{}", help='JSON object for params, e.g., "{\"name\":\"tool\",\"arguments\":{}}"')
 @click.option("--header", multiple=True, help="Extra request headers, can repeat. Format: 'Key: Value'")
-@click.option("--transport", type=click.Choice(["auto", "http", "sse"]), default="auto")
+@click.option("--transport", type=click.Choice(["auto", "http", "sse", "stdio"]), default="auto")
 @click.option("--timeout", type=float, default=12.0)
 @click.option("--sse-endpoint", help="Explicit SSE path, e.g., /sse")
+@click.option("--stdio-cmd", multiple=True, help="When --transport stdio, command to launch server (e.g., --stdio-cmd node --stdio-cmd build/index.js)")
 @click.option("--session-id", help="Pre-supplied session id to include in Mcp-Session-Id header")
 @click.option("--verbose", is_flag=True, default=False)
 @click.option("--auth-type", type=click.Choice(["bearer", "oauth2-client-credentials"]))
@@ -310,7 +324,7 @@ def _explain_single(finding, spec_index: Dict[str, Any], trace: list[dict]) -> l
 @click.option("--client-id")
 @click.option("--client-secret")
 @click.option("--scope")
-def rpc_cmd(url: str, method: str, params: str, header: list[str], transport: str, timeout: float, sse_endpoint: Optional[str], session_id: Optional[str], verbose: bool, auth_type: Optional[str], auth_token: Optional[str], token_url: Optional[str], client_id: Optional[str], client_secret: Optional[str], scope: Optional[str]) -> None:
+def rpc_cmd(url: str, method: str, params: str, header: list[str], transport: str, timeout: float, sse_endpoint: Optional[str], session_id: Optional[str], verbose: bool, auth_type: Optional[str], auth_token: Optional[str], token_url: Optional[str], client_id: Optional[str], client_secret: Optional[str], scope: Optional[str], stdio_cmd: List[str]) -> None:
     try:
         params_obj = json.loads(params) if params else {}
         if not isinstance(params_obj, dict):
@@ -329,7 +343,12 @@ def rpc_cmd(url: str, method: str, params: str, header: list[str], transport: st
         k, v = h.split(":", 1)
         headers[k.strip()] = v.strip()
     trace: Any = []
-    result = rpc_call(url, method, params_obj, headers=headers, trace=trace, verbose=verbose, timeout=timeout, transport=transport, sse_endpoint=sse_endpoint)
+    if transport == "stdio":
+        if not stdio_cmd:
+            raise click.ClickException("--stdio-cmd is required when --transport stdio")
+        result = rpc_call_stdio(list(stdio_cmd), method, params_obj)
+    else:
+        result = rpc_call(url, method, params_obj, headers=headers, trace=trace, verbose=verbose, timeout=timeout, transport=transport, sse_endpoint=sse_endpoint)
     console.print_json(json.dumps(result))
 
 
