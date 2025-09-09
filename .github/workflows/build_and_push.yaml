@@ -1,0 +1,79 @@
+---
+name: Build and Push Image
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "**"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+      # Cache Buildah storage
+      - name: Cache Buildah storage
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/containers/storage
+          key: ${{ runner.os }}-buildah-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildah-
+
+      # Install QEMU for multi-arch support
+      - name: Set up QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+
+      # Set tags dynamically based on branch or tag
+      - name: Set tags dynamically
+        id: meta
+        run: |
+          TAGS=""
+          PUSH="false"
+          if [[ "${GITHUB_REF_TYPE}" == "branch" ]]; then
+            if [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+              TAGS="latest"
+              PUSH="true"
+            else
+              SAFE_BRANCH=$(echo "${GITHUB_REF_NAME}" | tr '/' '-')
+              TAGS="branch-${SAFE_BRANCH}"
+            fi
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAGS="${GITHUB_REF_NAME}"
+            PUSH="true"
+          fi
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+          echo "push=${PUSH}" >> $GITHUB_OUTPUT
+
+      # Build multi-arch image
+      - name: Build multi-arch image
+        id: build-image
+        uses: redhat-actions/buildah-build@v2
+        with:
+          image: mcp-aio/mcp-security-scanner
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+            ${{ github.sha }}
+          containerfiles: |
+            ./Containerfile
+          platforms: linux/amd64,linux/arm64
+          layers: true
+      # Push image to Quay.io (only main branch or tag)
+      - name: Push To quay.io
+        if: steps.meta.outputs.push == 'true'
+        id: push-to-quay
+        uses: redhat-actions/push-to-registry@v2
+        with:
+          image: ${{ steps.build-image.outputs.image }}
+          tags: ${{ steps.build-image.outputs.tags }}
+          registry: quay.io
+          username: mcp-aio+github
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Print image url
+        if: steps.meta.outputs.push == 'true'
+        run: echo "Image pushed to ${{ steps.push-to-quay.outputs.registry-paths }}"
