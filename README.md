@@ -134,6 +134,17 @@ mcp-scan scan \
 - **--session-id <SID>**: Pre-established session (`Mcp-Session-Id` header).
 
 
+### Running with Container
+
+```bash
+# Build container
+
+podman build -t mcp-scan .
+
+# Run
+podman run --rm mcp-scan scan --url ${MCP_SERVER} --format text
+```
+
 ## Acknowledgements
 - Vulnerability ideas inspired by `Damn Vulnerable MCP Server` - https://github.com/harishsg993010/damn-vulnerable-MCP-server
 - Ye Wang from Red Hat for all his help in resolving `init` problems with certain MCP servers
