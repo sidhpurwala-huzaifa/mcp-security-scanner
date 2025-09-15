@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import sys
 from typing import Optional, Any, Dict, Iterator, List
 
 import click
@@ -208,7 +209,13 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
             else:
                 for line in _explain_single(f, spec_index, list(trace) if isinstance(trace, list) else []):
                     console.print(f"- {line}")
-
+    failed = [f for f in report.findings if not f.passed]
+    if failed:
+        console.print(f"[red]Scan failed: {len(failed)} findings[/red]")
+        sys.exit(1)
+    else:
+        console.print("[green]All checks passed[/green]")
+        sys.exit(0)
 
 @main.command("scan-range")
 @click.option("--host", required=True, help="Target host, e.g., localhost")
