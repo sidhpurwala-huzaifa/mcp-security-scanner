@@ -72,7 +72,7 @@ jobs:
           tags: ${{ steps.build-image.outputs.tags }}
           registry: quay.io
           username: mcp-aio+github
-          token: ${{ secrets.TOKEN }}
+          password: ${{ secrets.TOKEN }}
 
       - name: Print image url
         if: steps.meta.outputs.push == 'true'
