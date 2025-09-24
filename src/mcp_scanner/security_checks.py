@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from typing import Any
+from typing import Any, List, Dict
 
 from .models import Finding, Severity
 from .spec import SpecCheck
@@ -118,7 +118,7 @@ def check_prompt_injection_heuristics(tools: list[dict[str, Any]], spec: SpecChe
         "hidden instruction",
     ]
 
-    hits = []
+    hits: List[Dict[str, object]] = []
     for tool in tools:
         desc = (tool.get("description") or "").lower()
         if any(phrase in desc for phrase in bad_phrases):
@@ -420,3 +420,67 @@ def check_indirect_prompt_injection(
 
     except Exception as e:
         return _finding(spec, passed=False, details=f"error={type(e).__name__}:{e}")
+
+
+def check_remote_access_control_exposure(
+    tools: list[dict[str, Any]],
+    send_recv_func: Callable[[str, dict[str, Any]], dict[str, Any]],
+    spec: SpecCheck,
+) -> Finding:
+    """
+    RC-01: Remote access control exposure.
+
+    Check if server exposes tools that enable/disable remote access or open ports
+    without strong authorization. Tests for tools with remote access keywords
+    and attempts to exploit them.
+    """
+    if len(tools) == 0:
+        return _finding(spec, passed=True, details="No tools were discovered")
+
+    # Look for tools that might enable remote access
+    candidates: list[dict[str, Any]] = []
+    for tool in tools:
+        name = (tool.get("name") or "").lower()
+        desc = (tool.get("description") or "").lower()
+
+        # Check for remote access keywords
+        remote_keywords_name = ["remote_access", "remote", "port"]
+        remote_keywords_desc = ["remote access", "open port", "expose", "bind"]
+
+        if (
+            any(keyword in name for keyword in remote_keywords_name)
+            or any(keyword in desc for keyword in remote_keywords_desc)
+        ):
+            candidates.append(tool)
+
+    # Attempt unauthenticated calls to test for remote access exposure
+    exploited = []
+    for tool in candidates:
+        tool_name = tool.get("name")
+        if tool_name:
+            try:
+                # Test with common remote access arguments
+                resp = send_recv_func(
+                    "tools/call", {"name": tool_name, "arguments": {"port": 8080}}
+                )
+                text = json.dumps(resp).lower()
+
+                # Check for indicators that remote access was enabled
+                success_indicators = [
+                    "remote_access_enabled:true",
+                    "remote-access:true",
+                    "enabled",
+                    "listening",
+                    "bound to",
+                    "server started"
+                ]
+
+                if any(indicator in text for indicator in success_indicators):
+                    exploited.append({"tool": tool_name, "resp": resp})
+            except Exception:
+                # Ignore exceptions during testing - tool might not accept these arguments
+                continue
+
+    passed = len(exploited) == 0
+    details = json.dumps({"candidates": candidates, "exploited": exploited})
+    return _finding(spec, passed, details)

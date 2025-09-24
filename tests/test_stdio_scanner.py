@@ -417,12 +417,12 @@ if __name__ == "__main__":
 
         findings = run_checks_stdio(cmd, spec_index)
 
-        # Should have findings for 10 security checks (A-01 skipped for stdio transport)
-        assert len(findings) == 10
+        # Should have findings for 11 security checks (A-01 skipped for stdio transport)
+        assert len(findings) == 11
 
         # Check that we have the expected check IDs (A-01 excluded for stdio)
         check_ids = {f.id for f in findings}
-        expected_ids = {"BASE-01", "X-01", "P-02", "X-03", "R-01", "R-02", "R-03", "X-02", "A-03", "P-03"}
+        expected_ids = {"BASE-01", "X-01", "P-02", "X-03", "R-01", "R-02", "R-03", "X-02", "A-03", "P-03", "RC-01"}
         assert check_ids == expected_ids
 
         # A-01 should be skipped (not applicable to local stdio transport)

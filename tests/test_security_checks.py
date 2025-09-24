@@ -13,6 +13,7 @@ from src.mcp_scanner.security_checks import (
     check_dangerous_capabilities,
     check_indirect_prompt_injection,
     check_prompt_injection_heuristics,
+    check_remote_access_control_exposure,
     check_sensitive_resource_exposure,
 )
 from src.mcp_scanner.spec import load_spec
@@ -488,6 +489,125 @@ class TestPromptInjectionHeuristics:
         assert result.passed  # Should pass with clean descriptions
         details = json.loads(result.details)
         assert len(details) == 0  # No tools flagged
+
+
+class TestRemoteAccessControlExposure:
+    """Test the RC-01 remote access control exposure check."""
+
+    def test_rc01_detects_remote_access_tools_without_authorization(self):
+        """Test that RC-01 detects tools that enable remote access without proper authorization."""
+        # Mock send_recv function that simulates successful remote access enablement
+        def mock_send_recv(method: str, params: dict) -> dict:
+            if method == "tools/call" and params.get("name") == "enable_remote_access":
+                return {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"status": "remote_access_enabled:true", "port": 8080},
+                }
+            return {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+        spec_index = load_spec()
+        rc01_spec = spec_index["RC-01"]
+
+        # Tools with remote access capabilities
+        remote_tools = [
+            {
+                "name": "enable_remote_access",
+                "description": "Enable remote access to the server",
+                "inputSchema": {"type": "object", "properties": {"port": {"type": "number"}}},
+            },
+            {
+                "name": "port_forwarder",
+                "description": "Open port and bind to external interface",
+                "inputSchema": {"type": "object", "properties": {"port": {"type": "number"}}},
+            },
+        ]
+
+        result = check_remote_access_control_exposure(remote_tools, mock_send_recv, rc01_spec)
+
+        assert not result.passed  # Should fail due to exploitable remote access
+        details = json.loads(result.details)
+        assert len(details["candidates"]) == 2  # Both tools should be flagged as candidates
+        assert len(details["exploited"]) == 1  # One tool should be successfully exploited
+
+    def test_rc01_passes_with_safe_tools(self):
+        """Test that RC-01 passes when no remote access tools are present."""
+        def mock_send_recv(method: str, params: dict) -> dict:
+            return {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+        spec_index = load_spec()
+        rc01_spec = spec_index["RC-01"]
+
+        # Safe tools without remote access keywords
+        safe_tools = [
+            {
+                "name": "calculate_sum",
+                "description": "Add two numbers together",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+                },
+            },
+            {
+                "name": "get_weather",
+                "description": "Get weather information for a city",
+                "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}},
+            },
+        ]
+
+        result = check_remote_access_control_exposure(safe_tools, mock_send_recv, rc01_spec)
+
+        assert result.passed  # Should pass with safe tools
+        details = json.loads(result.details)
+        assert len(details["candidates"]) == 0  # No candidates found
+        assert len(details["exploited"]) == 0  # No tools exploited
+
+    def test_rc01_detects_candidates_but_no_exploitation(self):
+        """Test that RC-01 detects suspicious tools but passes if they can't be exploited."""
+        # Mock send_recv function that doesn't return exploitation indicators
+        def mock_send_recv(method: str, params: dict) -> dict:
+            if method == "tools/call":
+                return {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"status": "access_denied", "error": "insufficient_permissions"},
+                }
+            return {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+        spec_index = load_spec()
+        rc01_spec = spec_index["RC-01"]
+
+        # Tools with suspicious names but proper access control
+        suspicious_tools = [
+            {
+                "name": "remote_admin",
+                "description": "Administrative remote access tool",
+                "inputSchema": {"type": "object", "properties": {"port": {"type": "number"}}},
+            }
+        ]
+
+        result = check_remote_access_control_exposure(suspicious_tools, mock_send_recv, rc01_spec)
+
+        assert result.passed  # Should pass because exploitation failed
+        details = json.loads(result.details)
+        assert len(details["candidates"]) == 1  # Tool should be flagged as candidate
+        assert len(details["exploited"]) == 0  # But not successfully exploited
+
+    def test_rc01_passes_with_no_tools(self):
+        """Test that RC-01 passes when no tools are available."""
+        def mock_send_recv(method: str, params: dict) -> dict:
+            return {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+        spec_index = load_spec()
+        rc01_spec = spec_index["RC-01"]
+
+        # No tools available
+        no_tools = []
+
+        result = check_remote_access_control_exposure(no_tools, mock_send_recv, rc01_spec)
+
+        assert result.passed  # Should pass with no tools
+        assert "No tools were discovered" in result.details
 
 
 if __name__ == "__main__":

@@ -241,10 +241,8 @@ def run_checks_stdio(cmd: str, spec_index: dict[str, SpecCheck]) -> list[Finding
         #   file systems and should have proper path restrictions
         # - Token checks (A-03): Local servers may call external APIs and leak tokens
         # - Prompt injection (P-03): Local servers can fetch external content
+        # - Remote access control (RC-01): Local servers can expose network services
         # =============================================================================
-
-        # A-01: Unauthenticated access - SKIP for stdio transport
-        # A-01 is specifically for "remote servers" but stdio is local process communication
 
         # X-01: Dangerous capability detection
         x01 = spec_index.get("X-01")
@@ -320,6 +318,17 @@ def run_checks_stdio(cmd: str, spec_index: dict[str, SpecCheck]) -> list[Finding
                     resources, tools, client.send_recv, p03
                 )
             )
+
+        # RC-01: Remote access control exposure
+        # NOTE: This check is relevant for stdio transport because local MCP servers
+        # can still expose tools that enable remote access, open network ports, or
+        # create network services. Examples include development servers, file sharing
+        # tools, proxy/tunnel tools, or collaboration features that bind to network
+        # interfaces. Even though the MCP communication is local, the tools themselves
+        # might expose network services that bypass normal access controls.
+        rc01 = spec_index.get("RC-01")
+        if rc01:
+            findings.append(security_checks.check_remote_access_control_exposure(tools, client.send_recv, rc01))
 
     finally:
         client.close()
