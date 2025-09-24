@@ -1,6 +1,6 @@
 MCP Security Scanner
 
-This is a Python-based penetration testing tool for Model Context Protocol (MCP) servers. It supports Streamable HTTP and SSE transports, runs a suite of checks mapped to `scanner_specs.schema` (auth, transport, tools, prompts, resources), and includes a deliberately insecure MCP-like server for testing.
+This is a Python-based penetration testing tool for Model Context Protocol (MCP) servers. It supports HTTP, stdio, and experimental SSE transports, runs a suite of checks mapped to `scanner_specs.schema` (auth, transport, tools, prompts, resources), and includes a deliberately insecure MCP-like server for testing.
 
 **Note: SSE transport is discontinued in the latest version of MCP. Support for SSE in this tool is purely experimental and may not work!!!**
 
@@ -54,7 +54,7 @@ insecure-mcp-server --host 127.0.0.1 --port 9001
 insecure-mcp-server --host 127.0.0.1 --port 9001 --test 0/1/2/3/4/5/6/7
 ```
 
-### Scan the server (HTTP or SSE)
+### Scan the server (HTTP, stdio, or SSE)
 ```bash
 # HTTP: Text report (no discovery; --url is the JSON-RPC endpoint)
 mcp-scan scan --url http://127.0.0.1:9001/mcp --format text
@@ -65,16 +65,21 @@ mcp-scan scan --url http://127.0.0.1:9001/mcp --format json --output report.json
 # HTTP: Verbose tracing (real-time)
 mcp-scan scan --url http://127.0.0.1:9001/mcp --verbose
 
+# stdio: Scan local MCP servers via stdin/stdout
+mcp-scan scan --transport stdio --command "npx -y @modelcontextprotocol/server-memory" --format json
+
 # SSE: connect to explicit SSE endpoint, then scan via emitted /messages?sessionId=...
 mcp-scan scan --url https://your-mcp.example.com --transport sse --sse-endpoint /sse --timeout 30 --verbose
 ```
 
 ### New: RPC passthrough (Inspector-like)
+**Note: RPC commands only support HTTP and SSE transports, not stdio.**
+
 ```bash
-# List tools
+# List tools (HTTP)
 mcp-scan rpc --url https://your-mcp.example.com/mcp --method tools/list --transport http
 
-# Call a tool
+# Call a tool (HTTP)
 mcp-scan rpc --url https://your-mcp.example.com/mcp \
   --method tools/call \
   --params '{"name":"weather","arguments":{"city":"Paris"}}' \
@@ -99,13 +104,16 @@ mcp-scan scan --url https://your-mcp.example.com/mcp --explain X-01
 
 ### Only health
 - `--only-health` prints server details and enumerations without running the full scan.
-- Works for HTTP and SSE (SSE uses the provided endpoint and the stream-emitted POST path).
+- Works for HTTP, stdio, and SSE transports.
 - Supports `--format text` and `--format json`.
 
 Examples:
 ```bash
 # HTTP
 mcp-scan scan --url https://your-mcp.example.com/mcp --only-health --format text
+
+# stdio
+mcp-scan scan --transport stdio --command "npx -y @modelcontextprotocol/server-memory" --only-health --format json
 
 # SSE
 mcp-scan scan --url https://your-mcp.example.com --transport sse --sse-endpoint /sse --only-health --format json
@@ -129,10 +137,34 @@ mcp-scan scan \
 ```
 
 ### Transport, timeouts, session
-- **--transport auto|http|sse**: Hint preferred transport; no dynamic discovery. Provide working URLs.
+- **--transport auto|http|stdio|sse**: Hint preferred transport; no dynamic discovery.
+  - `http`: Requires `--url` for JSON-RPC endpoint
+  - `stdio`: Requires `--command` for local MCP server process
+  - `sse`: Requires `--url` and `--sse-endpoint` (experimental)
 - **--timeout <seconds>**: Per-request read timeout (default 12s). Increase for slow streams.
 - **--session-id <SID>**: Pre-established session (`Mcp-Session-Id` header).
 
+
+## Testing
+
+### Running Tests
+```bash
+# Set up environment (if not already done)
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+
+# Run all tests
+python -m pytest tests/ -v
+
+# Run specific test module
+python -m pytest tests/test_stdio_scanner.py -v
+python -m pytest tests/test_security_checks.py -v
+
+# Run specific test class
+python -m pytest tests/test_stdio_scanner.py::TestStdioIntegration -v
+```
 
 ### Running with Container
 

@@ -1,0 +1,1 @@
+# Test package for MCP Security Scanner
