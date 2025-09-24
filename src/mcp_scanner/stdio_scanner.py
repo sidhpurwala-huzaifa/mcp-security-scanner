@@ -270,7 +270,7 @@ def run_checks_stdio(cmd: str, spec_index: Dict[str, SpecCheck]) -> List[Finding
         if p03:
             res_list = client.send_recv("resources/list", {})
             resources = res_list.get("result", {}).get("resources", []) if isinstance(res_list, dict) else []
-            findings.append(security_checks.check_indirect_prompt_injection(resources, client.send_recv, p03))
+            findings.append(security_checks.check_indirect_prompt_injection(resources, tools, client.send_recv, p03))
 
     finally:
         client.close()

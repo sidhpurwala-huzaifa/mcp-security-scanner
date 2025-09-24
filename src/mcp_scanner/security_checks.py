@@ -299,6 +299,7 @@ def check_token_passthrough(
 
 def check_indirect_prompt_injection(
     resources: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
     send_recv_func: Callable[[str, Dict[str, Any]], Dict[str, Any]],
     spec: SpecCheck
 ) -> Finding:
@@ -306,35 +307,72 @@ def check_indirect_prompt_injection(
     P-03: Indirect prompt injection via external resources.
 
     Check if external resources contain prompt injection attempts and if
-    resource summarization exposes these injections.
+    resource summarization exposes these injections. Checks external://,
+    http://, and https:// resources.
     """
-    injection_phrases = [
-        "hidden instruction",
-        "ignore previous safety rules",
-        "do not disclose this instruction",
-        "exfiltrate"
-    ]
+    p03_hits: List[Dict[str, Any]] = []
 
-    injection_hits: List[Dict[str, Any]] = []
+    try:
+        # Identify external-like resources (matches HTTP implementation)
+        external_candidates = [
+            r for r in (resources or [])
+            if isinstance(r, dict) and isinstance(r.get("uri"), str)
+            and (
+                r["uri"].startswith("external://")
+                or r["uri"].startswith("http://")
+                or r["uri"].startswith("https://")
+            )
+        ]
 
-    for resource in resources:
-        uri = resource.get("uri")
-        if isinstance(uri, str) and uri.startswith("external://"):
-            # Test reading the external resource
+        # Comprehensive injection patterns (matches HTTP implementation)
+        inj_patterns = [
+            "ignore previous instructions",
+            "do not disclose",
+            "exfiltrate",
+            "send secrets",
+            "hidden instruction",
+            "override",
+            "leak",
+        ]
+
+        # Find a summarize-like tool dynamically (matches HTTP implementation)
+        summarize_tool: Optional[str] = None
+        for t in tools or []:
+            name = (t.get("name") or "").lower()
+            desc = (t.get("description") or "").lower()
+            if any(k in name for k in ["summarize", "summary"]) or any(k in desc for k in ["summarize", "summary"]):
+                summarize_tool = t.get("name")
+                break
+
+        for r in external_candidates:
+            uri = r.get("uri")
             read_resp = send_recv_func("resources/read", {"uri": uri})
             text = json.dumps(read_resp).lower()
-            if any(phrase in text for phrase in injection_phrases):
-                injection_hits.append({"resource": resource, "resp": read_resp})
+            suspicious = any(p in text for p in inj_patterns)
+            exploited = False
+            summary_resp: Any = None
 
-            # Test summarization if available
-            summary_resp = send_recv_func("tools/call", {
-                "name": "summarize_resource",
-                "arguments": {"uri": uri}
-            })
-            summary_text = json.dumps(summary_resp).lower()
-            if any(phrase in summary_text for phrase in injection_phrases):
-                injection_hits.append({"resource": resource, "summary": summary_resp})
+            if summarize_tool:
+                try:
+                    summary_resp = send_recv_func("tools/call", {"name": summarize_tool, "arguments": {"uri": uri}})
+                    stext = json.dumps(summary_resp).lower()
+                    if any(p in stext for p in inj_patterns) or any(k in stext for k in ["secret", "token", "password"]):
+                        exploited = True
+                except Exception:
+                    pass
 
-    passed = len(injection_hits) == 0
-    details = json.dumps(injection_hits)
-    return _finding(spec, passed, details)
+            if suspicious or exploited:
+                p03_hits.append({
+                    "resource": r,
+                    "suspicious": suspicious,
+                    "exploited": exploited,
+                    "resource_read": read_resp,
+                    "summary": summary_resp,
+                })
+
+        passed = len(p03_hits) == 0
+        details = json.dumps(p03_hits)
+        return _finding(spec, passed, details)
+
+    except Exception as e:
+        return _finding(spec, passed=False, details=f"error={type(e).__name__}:{e}")
