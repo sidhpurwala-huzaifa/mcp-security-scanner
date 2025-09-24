@@ -537,5 +537,119 @@ while True:
         assert "non-json" in findings[0].details
 
 
+class TestSensitiveResourceDetection:
+    """Test the R-03 sensitive resource exposure check."""
+
+    def test_r03_detects_suspicious_resource_names_with_clean_content(self):
+        """Test that R-03 does NOT flag resources with suspicious names but clean content."""
+        from src.mcp_scanner.security_checks import check_sensitive_resource_exposure
+        from src.mcp_scanner.spec import load_spec
+
+        # Mock send_recv function that returns clean content
+        def mock_send_recv(method: str, params: dict) -> dict:
+            return {"jsonrpc": "2.0", "id": 1, "result": {"contents": [{"type": "text", "text": "clean config data"}]}}
+
+        spec_index = load_spec()
+        r03_spec = spec_index["R-03"]
+
+        # Test resources with suspicious names but clean content
+        suspicious_resources = [
+            {"name": "secret_config", "uri": "file://config.json"},  # Suspicious name, clean content
+            {"name": "api_credentials", "uri": "file://creds.json"},  # Suspicious name, clean content
+        ]
+
+        result = check_sensitive_resource_exposure(suspicious_resources, mock_send_recv, r03_spec)
+
+        assert result.passed  # Should pass because content is clean
+        details = json.loads(result.details)
+        assert len(details) == 0  # No resources flagged due to clean content
+
+    def test_r03_detects_suspicious_resource_content(self):
+        """Test that R-03 detects sensitive content within resources."""
+        from src.mcp_scanner.security_checks import check_sensitive_resource_exposure
+        from src.mcp_scanner.spec import load_spec
+
+        # Mock send_recv function that returns sensitive content
+        def mock_send_recv_with_secrets(method: str, params: dict) -> dict:
+            if method == "resources/read":
+                return {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "contents": [{
+                            "type": "text",
+                            "text": "password=mysecret\napikey=sk-1234567\nusername: admin"
+                        }]
+                    }
+                }
+            return {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+        spec_index = load_spec()
+        r03_spec = spec_index["R-03"]
+
+        # Resource with suspicious name that also contains sensitive content
+        resources = [{"name": "secret_config", "uri": "file://config.json"}]
+
+        result = check_sensitive_resource_exposure(resources, mock_send_recv_with_secrets, r03_spec)
+
+        assert not result.passed  # Should fail due to sensitive content
+        details = json.loads(result.details)
+        assert len(details) == 1
+        assert "resp" in details[0]  # Should include the response with sensitive content
+
+    def test_r03_passes_with_clean_resources(self):
+        """Test that R-03 passes when resources are clean."""
+        from src.mcp_scanner.security_checks import check_sensitive_resource_exposure
+        from src.mcp_scanner.spec import load_spec
+
+        # Mock send_recv function that returns clean content
+        def mock_send_recv_clean(method: str, params: dict) -> dict:
+            if method == "resources/read":
+                return {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "contents": [{"type": "text", "text": "just normal config data"}]
+                    }
+                }
+            return {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+        spec_index = load_spec()
+        r03_spec = spec_index["R-03"]
+
+        # Clean resources
+        clean_resources = [
+            {"name": "user_preferences", "uri": "file://prefs.json"},
+            {"name": "app_settings", "uri": "file://settings.json"},
+        ]
+
+        result = check_sensitive_resource_exposure(clean_resources, mock_send_recv_clean, r03_spec)
+
+        assert result.passed  # Should pass with clean resources
+        details = json.loads(result.details)
+        assert len(details) == 0  # No suspicious resources found
+
+    def test_r03_handles_resource_without_uri(self):
+        """Test that R-03 handles resources with suspicious names but no URI."""
+        from src.mcp_scanner.security_checks import check_sensitive_resource_exposure
+        from src.mcp_scanner.spec import load_spec
+
+        def mock_send_recv(method: str, params: dict) -> dict:
+            return {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+        spec_index = load_spec()
+        r03_spec = spec_index["R-03"]
+
+        # Resource with suspicious name but no URI
+        resources = [{"name": "secret_data"}]  # No URI field
+
+        result = check_sensitive_resource_exposure(resources, mock_send_recv, r03_spec)
+
+        assert not result.passed  # Should fail due to suspicious name
+        details = json.loads(result.details)
+        assert len(details) == 1
+        assert details[0]["resp"] is None  # No response since no URI to read
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

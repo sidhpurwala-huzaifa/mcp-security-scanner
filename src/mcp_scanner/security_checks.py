@@ -177,12 +177,17 @@ def check_resource_access_control(
     return _finding(spec, passed, details)
 
 
-def check_sensitive_resource_exposure(resources: List[Dict[str, Any]], spec: SpecCheck) -> Finding:
+def check_sensitive_resource_exposure(
+    resources: List[Dict[str, Any]],
+    send_recv_func: Callable[[str, Dict[str, Any]], Dict[str, Any]],
+    spec: SpecCheck
+) -> Finding:
     """
     R-03: Sensitive resource exposure.
 
     Check if any listed resources contain sensitive keywords that could
     indicate exposed credentials, secrets, or other sensitive data.
+    Also reads suspicious resources to examine their content.
     """
     sensitive_keywords = ["credential", "secret", "token", "key", "password"]
     suspects = []
@@ -191,7 +196,19 @@ def check_sensitive_resource_exposure(resources: List[Dict[str, Any]], spec: Spe
         name = (resource.get("name") or "").lower()
         uri = (resource.get("uri") or "").lower()
         if any(keyword in name or keyword in uri for keyword in sensitive_keywords):
-            suspects.append(resource)
+            if resource.get("uri"):
+                # Actually read the resource to examine its content
+                resp = send_recv_func("resources/read", {"uri": resource["uri"]})
+                text = json.dumps(resp).lower()
+                # Check for additional sensitive content indicators
+                content_indicators = ["password", "apikey", "api key", "sk-", "postgresql://", "username:"]
+                if any(indicator in text for indicator in content_indicators):
+                    suspects.append({"resource": resource, "resp": resp})
+                # Note: If resource has suspicious name but clean content, we don't flag it
+                # This matches the HTTP implementation behavior
+            else:
+                # Resource has suspicious name but no URI to read - always flag this
+                suspects.append({"resource": resource, "resp": None})
 
     passed = len(suspects) == 0
     details = json.dumps(suspects)

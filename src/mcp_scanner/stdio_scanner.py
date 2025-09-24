@@ -247,7 +247,7 @@ def run_checks_stdio(cmd: str, spec_index: Dict[str, SpecCheck]) -> List[Finding
         if r03:
             res_list = client.send_recv("resources/list", {})
             resources = res_list.get("result", {}).get("resources", []) if isinstance(res_list, dict) else []
-            findings.append(security_checks.check_sensitive_resource_exposure(resources, r03))
+            findings.append(security_checks.check_sensitive_resource_exposure(resources, client.send_recv, r03))
 
         # X-02: Injection fuzzing
         x02 = spec_index.get("X-02")
