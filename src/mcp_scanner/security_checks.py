@@ -15,7 +15,8 @@ Design principles:
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 from .models import Finding, Severity
 from .spec import SpecCheck
@@ -35,7 +36,7 @@ def _finding(spec: SpecCheck, passed: bool, details: str) -> Finding:
     )
 
 
-def check_unauthenticated_access(tools: List[Dict[str, Any]], spec: SpecCheck) -> Finding:
+def check_unauthenticated_access(tools: list[dict[str, Any]], spec: SpecCheck) -> Finding:
     """
     A-01: Authentication required for remote servers.
 
@@ -47,7 +48,7 @@ def check_unauthenticated_access(tools: List[Dict[str, Any]], spec: SpecCheck) -
     return _finding(spec, passed, details)
 
 
-def check_dangerous_capabilities(tools: List[Dict[str, Any]], spec: SpecCheck) -> Finding:
+def check_dangerous_capabilities(tools: list[dict[str, Any]], spec: SpecCheck) -> Finding:
     """
     X-01: Dangerous capability detection in tools.
 
@@ -55,11 +56,25 @@ def check_dangerous_capabilities(tools: List[Dict[str, Any]], spec: SpecCheck) -
     Tools with risky keywords should have input validation constraints.
     """
     risky_keywords = [
-        "exec", "command", "shell", "write_file", "delete", "rm", "chmod", "chown",
-        "fetch", "http", "url", "eval", "render", "payment", "admin", "privilege",
+        "exec",
+        "command",
+        "shell",
+        "write_file",
+        "delete",
+        "rm",
+        "chmod",
+        "chown",
+        "fetch",
+        "http",
+        "url",
+        "eval",
+        "render",
+        "payment",
+        "admin",
+        "privilege",
     ]
 
-    risky_tools: List[Dict[str, Any]] = []
+    risky_tools: list[dict[str, Any]] = []
     for tool in tools:
         name = (tool.get("name") or "").lower()
         desc = (tool.get("description") or "").lower()
@@ -69,13 +84,19 @@ def check_dangerous_capabilities(tools: List[Dict[str, Any]], spec: SpecCheck) -
         has_constraints = False
         if isinstance(schema, dict):
             props = schema.get("properties") or {}
-            for _, prop in (props.items() if isinstance(props, dict) else []):
-                if any(k in prop for k in ("enum", "pattern", "minimum", "maximum", "minLength", "maxLength")):
+            for _, prop in props.items() if isinstance(props, dict) else []:
+                if any(
+                    k in prop
+                    for k in ("enum", "pattern", "minimum", "maximum", "minLength", "maxLength")
+                ):
                     has_constraints = True
                     break
 
         # If tool has risky keywords but no constraints, it's dangerous
-        if any(keyword in name or keyword in desc for keyword in risky_keywords) and not has_constraints:
+        if (
+            any(keyword in name or keyword in desc for keyword in risky_keywords)
+            and not has_constraints
+        ):
             risky_tools.append(tool)
 
     passed = len(risky_tools) == 0
@@ -83,7 +104,7 @@ def check_dangerous_capabilities(tools: List[Dict[str, Any]], spec: SpecCheck) -
     return _finding(spec, passed, details)
 
 
-def check_prompt_injection_heuristics(tools: List[Dict[str, Any]], spec: SpecCheck) -> Finding:
+def check_prompt_injection_heuristics(tools: list[dict[str, Any]], spec: SpecCheck) -> Finding:
     """
     P-02: Prompt/description injection heuristics.
 
@@ -109,9 +130,7 @@ def check_prompt_injection_heuristics(tools: List[Dict[str, Any]], spec: SpecChe
 
 
 def check_tool_stability(
-    tools_first: List[Dict[str, Any]],
-    tools_second: List[Dict[str, Any]],
-    spec: SpecCheck
+    tools_first: list[dict[str, Any]], tools_second: list[dict[str, Any]], spec: SpecCheck
 ) -> Finding:
     """
     X-03: Tool description stability (anti rug-pull).
@@ -120,7 +139,8 @@ def check_tool_stability(
     which could indicate a rug-pull attack where tools change behavior
     after being approved.
     """
-    def tool_key(tool: Dict[str, Any]) -> tuple:
+
+    def tool_key(tool: dict[str, Any]) -> tuple:
         return (tool.get("name"), tool.get("description"))
 
     set1 = {tool_key(t) for t in tools_first}
@@ -129,11 +149,21 @@ def check_tool_stability(
     diff = []
     if set1 != set2:
         # Find tools that changed
-        for (name, desc) in set1.symmetric_difference(set2):
-            diff.append({
-                "before": [t for t in tools_first if t.get("name") == name and t.get("description") == desc],
-                "after": [t for t in tools_second if t.get("name") == name and t.get("description") == desc]
-            })
+        for name, desc in set1.symmetric_difference(set2):
+            diff.append(
+                {
+                    "before": [
+                        t
+                        for t in tools_first
+                        if t.get("name") == name and t.get("description") == desc
+                    ],
+                    "after": [
+                        t
+                        for t in tools_second
+                        if t.get("name") == name and t.get("description") == desc
+                    ],
+                }
+            )
 
     passed = len(diff) == 0
     details = json.dumps(diff)
@@ -141,8 +171,7 @@ def check_tool_stability(
 
 
 def check_resource_traversal(
-    send_recv_func: Callable[[str, Dict[str, Any]], Dict[str, Any]],
-    spec: SpecCheck
+    send_recv_func: Callable[[str, dict[str, Any]], dict[str, Any]], spec: SpecCheck
 ) -> Finding:
     """
     R-01: Resource URI validation & path traversal prevention.
@@ -160,8 +189,7 @@ def check_resource_traversal(
 
 
 def check_resource_access_control(
-    send_recv_func: Callable[[str, Dict[str, Any]], Dict[str, Any]],
-    spec: SpecCheck
+    send_recv_func: Callable[[str, dict[str, Any]], dict[str, Any]], spec: SpecCheck
 ) -> Finding:
     """
     R-02: Per-resource access control.
@@ -178,9 +206,9 @@ def check_resource_access_control(
 
 
 def check_sensitive_resource_exposure(
-    resources: List[Dict[str, Any]],
-    send_recv_func: Callable[[str, Dict[str, Any]], Dict[str, Any]],
-    spec: SpecCheck
+    resources: list[dict[str, Any]],
+    send_recv_func: Callable[[str, dict[str, Any]], dict[str, Any]],
+    spec: SpecCheck,
 ) -> Finding:
     """
     R-03: Sensitive resource exposure.
@@ -201,7 +229,14 @@ def check_sensitive_resource_exposure(
                 resp = send_recv_func("resources/read", {"uri": resource["uri"]})
                 text = json.dumps(resp).lower()
                 # Check for additional sensitive content indicators
-                content_indicators = ["password", "apikey", "api key", "sk-", "postgresql://", "username:"]
+                content_indicators = [
+                    "password",
+                    "apikey",
+                    "api key",
+                    "sk-",
+                    "postgresql://",
+                    "username:",
+                ]
                 if any(indicator in text for indicator in content_indicators):
                     suspects.append({"resource": resource, "resp": resp})
                 # Note: If resource has suspicious name but clean content, we don't flag it
@@ -216,9 +251,9 @@ def check_sensitive_resource_exposure(
 
 
 def check_injection_fuzzing(
-    tools: List[Dict[str, Any]],
-    send_recv_func: Callable[[str, Dict[str, Any]], Dict[str, Any]],
-    spec: SpecCheck
+    tools: list[dict[str, Any]],
+    send_recv_func: Callable[[str, dict[str, Any]], dict[str, Any]],
+    spec: SpecCheck,
 ) -> Finding:
     """
     X-02: Input validation & injection fuzzing.
@@ -231,7 +266,7 @@ def check_injection_fuzzing(
         "$(whoami)",
         "`uname -a`",
         "../../../../etc/passwd",
-        "http://169.254.169.254/latest/meta-data/"
+        "http://169.254.169.254/latest/meta-data/",
     ]
 
     observed_danger = []
@@ -242,7 +277,7 @@ def check_injection_fuzzing(
 
         # Find a string parameter to test
         str_param = None
-        for param_name, param_def in (props.items() if isinstance(props, dict) else []):
+        for param_name, param_def in props.items() if isinstance(props, dict) else []:
             if param_def.get("type") == "string":
                 str_param = param_name
                 break
@@ -252,20 +287,21 @@ def check_injection_fuzzing(
 
         # Test each payload
         for payload in payloads:
-            resp = send_recv_func("tools/call", {
-                "name": name,
-                "arguments": {str_param: payload}
-            })
+            resp = send_recv_func("tools/call", {"name": name, "arguments": {str_param: payload}})
 
             # Check if response contains system information (dangerous)
             text = json.dumps(resp).lower()
-            danger_indicators = ["uid=", "linux", "root:x:", "etc/passwd", "meta-data", "insecure", "stdout"]
+            danger_indicators = [
+                "uid=",
+                "linux",
+                "root:x:",
+                "etc/passwd",
+                "meta-data",
+                "insecure",
+                "stdout",
+            ]
             if any(indicator in text for indicator in danger_indicators):
-                observed_danger.append({
-                    "tool": name,
-                    "payload": payload,
-                    "resp": resp
-                })
+                observed_danger.append({"tool": name, "payload": payload, "resp": resp})
                 break  # Stop testing this tool after first dangerous response
 
     passed = len(observed_danger) == 0
@@ -274,8 +310,7 @@ def check_injection_fuzzing(
 
 
 def check_token_passthrough(
-    send_recv_func: Callable[[str, Dict[str, Any]], Dict[str, Any]],
-    spec: SpecCheck
+    send_recv_func: Callable[[str, dict[str, Any]], dict[str, Any]], spec: SpecCheck
 ) -> Finding:
     """
     A-03: Token indirection (no upstream token pass-through).
@@ -283,10 +318,9 @@ def check_token_passthrough(
     Test if the server leaks upstream access tokens through tool responses.
     """
     # Try to call a tool that might expose tokens
-    leak_attempt = send_recv_func("tools/call", {
-        "name": "upstream_access",
-        "arguments": {"code": "dummy"}
-    })
+    leak_attempt = send_recv_func(
+        "tools/call", {"name": "upstream_access", "arguments": {"code": "dummy"}}
+    )
 
     text = json.dumps(leak_attempt).lower()
     token_indicators = ["access_token", "sk-", "token-body", "bearer "]
@@ -298,10 +332,10 @@ def check_token_passthrough(
 
 
 def check_indirect_prompt_injection(
-    resources: List[Dict[str, Any]],
-    tools: List[Dict[str, Any]],
-    send_recv_func: Callable[[str, Dict[str, Any]], Dict[str, Any]],
-    spec: SpecCheck
+    resources: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    send_recv_func: Callable[[str, dict[str, Any]], dict[str, Any]],
+    spec: SpecCheck,
 ) -> Finding:
     """
     P-03: Indirect prompt injection via external resources.
@@ -310,13 +344,15 @@ def check_indirect_prompt_injection(
     resource summarization exposes these injections. Checks external://,
     http://, and https:// resources.
     """
-    p03_hits: List[Dict[str, Any]] = []
+    p03_hits: list[dict[str, Any]] = []
 
     try:
         # Identify external-like resources (matches HTTP implementation)
         external_candidates = [
-            r for r in (resources or [])
-            if isinstance(r, dict) and isinstance(r.get("uri"), str)
+            r
+            for r in (resources or [])
+            if isinstance(r, dict)
+            and isinstance(r.get("uri"), str)
             and (
                 r["uri"].startswith("external://")
                 or r["uri"].startswith("http://")
@@ -336,11 +372,13 @@ def check_indirect_prompt_injection(
         ]
 
         # Find a summarize-like tool dynamically (matches HTTP implementation)
-        summarize_tool: Optional[str] = None
+        summarize_tool: str | None = None
         for t in tools or []:
             name = (t.get("name") or "").lower()
             desc = (t.get("description") or "").lower()
-            if any(k in name for k in ["summarize", "summary"]) or any(k in desc for k in ["summarize", "summary"]):
+            if any(k in name for k in ["summarize", "summary"]) or any(
+                k in desc for k in ["summarize", "summary"]
+            ):
                 summarize_tool = t.get("name")
                 break
 
@@ -354,21 +392,27 @@ def check_indirect_prompt_injection(
 
             if summarize_tool:
                 try:
-                    summary_resp = send_recv_func("tools/call", {"name": summarize_tool, "arguments": {"uri": uri}})
+                    summary_resp = send_recv_func(
+                        "tools/call", {"name": summarize_tool, "arguments": {"uri": uri}}
+                    )
                     stext = json.dumps(summary_resp).lower()
-                    if any(p in stext for p in inj_patterns) or any(k in stext for k in ["secret", "token", "password"]):
+                    if any(p in stext for p in inj_patterns) or any(
+                        k in stext for k in ["secret", "token", "password"]
+                    ):
                         exploited = True
                 except Exception:
                     pass
 
             if suspicious or exploited:
-                p03_hits.append({
-                    "resource": r,
-                    "suspicious": suspicious,
-                    "exploited": exploited,
-                    "resource_read": read_resp,
-                    "summary": summary_resp,
-                })
+                p03_hits.append(
+                    {
+                        "resource": r,
+                        "suspicious": suspicious,
+                        "exploited": exploited,
+                        "resource_read": read_resp,
+                        "summary": summary_resp,
+                    }
+                )
 
         passed = len(p03_hits) == 0
         details = json.dumps(p03_hits)

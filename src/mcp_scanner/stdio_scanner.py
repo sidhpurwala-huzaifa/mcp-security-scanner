@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import shlex
 import subprocess
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
+from . import security_checks
 from .models import Finding, Report, Severity
 from .spec import SpecCheck
-from . import security_checks
 
 
 def _finding(spec: SpecCheck, passed: bool, details: str) -> Finding:
@@ -50,9 +50,11 @@ class StdioClient:
             stderr_output = ""
             if self.proc.stderr:
                 stderr_output = self.proc.stderr.read()
-            raise RuntimeError(f"Command '{cmd}' exited immediately with code {self.proc.returncode}. Stderr: {stderr_output}")
+            raise RuntimeError(
+                f"Command '{cmd}' exited immediately with code {self.proc.returncode}. Stderr: {stderr_output}"
+            )
 
-    def send_recv(self, method: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    def send_recv(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """
         Send JSON-RPC request to MCP server and receive response.
 
@@ -75,7 +77,11 @@ class StdioClient:
             stderr_output = ""
             if self.proc.stderr:
                 stderr_output = self.proc.stderr.read()
-            return {"error": "process_died", "exit_code": self.proc.returncode, "stderr": stderr_output}
+            return {
+                "error": "process_died",
+                "exit_code": self.proc.returncode,
+                "stderr": stderr_output,
+            }
 
         if self.proc.stdin is None or self.proc.stdout is None:
             return {"error": "stdio_unavailable", "message": "stdin/stdout pipes not available"}
@@ -92,7 +98,10 @@ class StdioClient:
         try:
             resp_line = self.proc.stdout.readline()
             if not resp_line:  # EOF - process likely died
-                return {"error": "no_response", "message": "Process returned no data (likely crashed)"}
+                return {
+                    "error": "no_response",
+                    "message": "Process returned no data (likely crashed)",
+                }
         except Exception as e:
             return {"error": "read_failed", "message": f"Failed to read from process: {e}"}
 
@@ -116,6 +125,7 @@ class StdioClient:
                 self.proc.terminate()
                 # Give it a moment to terminate gracefully
                 import time
+
                 time.sleep(0.1)
                 if self.proc.poll() is None:
                     self.proc.kill()  # Force kill if still running
@@ -148,13 +158,20 @@ def _is_process_error(resp: Any) -> bool:
     # Check for our custom error codes
     if "error" in resp:
         error_type = resp.get("error")
-        return error_type in ["process_died", "stdio_unavailable", "write_failed", "read_failed", "no_response", "non-json"]
+        return error_type in [
+            "process_died",
+            "stdio_unavailable",
+            "write_failed",
+            "read_failed",
+            "no_response",
+            "non-json",
+        ]
 
     return False
 
 
-def run_checks_stdio(cmd: str, spec_index: Dict[str, SpecCheck]) -> List[Finding]:
-    findings: List[Finding] = []
+def run_checks_stdio(cmd: str, spec_index: dict[str, SpecCheck]) -> list[Finding]:
+    findings: list[Finding] = []
 
     try:
         client = StdioClient(cmd)
@@ -173,10 +190,16 @@ def run_checks_stdio(cmd: str, spec_index: Dict[str, SpecCheck]) -> List[Finding
 
             # Check if we got an error response indicating process issues
             if _is_process_error(resp):
-                findings.append(_finding(base, False, f"MCP server communication failed: {json.dumps(resp)}"))
+                findings.append(
+                    _finding(base, False, f"MCP server communication failed: {json.dumps(resp)}")
+                )
                 return findings  # Can't continue if server is dead
 
-            ok = isinstance(resp, dict) and "result" in resp and "capabilities" in resp.get("result", {})
+            ok = (
+                isinstance(resp, dict)
+                and "result" in resp
+                and "capabilities" in resp.get("result", {})
+            )
             findings.append(_finding(base, ok, json.dumps(resp)))
 
         # Get tools list for multiple checks
@@ -189,10 +212,18 @@ def run_checks_stdio(cmd: str, spec_index: Dict[str, SpecCheck]) -> List[Finding
             for check_id in ["X-01", "P-02", "X-03"]:  # Tool-related checks (excluding A-01)
                 check = spec_index.get(check_id)
                 if check:
-                    findings.append(_finding(check, False, f"Cannot complete check - MCP server died: {json.dumps(tools_list)}"))
+                    findings.append(
+                        _finding(
+                            check,
+                            False,
+                            f"Cannot complete check - MCP server died: {json.dumps(tools_list)}",
+                        )
+                    )
             return findings
 
-        tools = tools_list.get("result", {}).get("tools", []) if isinstance(tools_list, dict) else []
+        tools = (
+            tools_list.get("result", {}).get("tools", []) if isinstance(tools_list, dict) else []
+        )
 
         # =============================================================================
         # SECURITY CHECKS FOR STDIO TRANSPORT
@@ -229,7 +260,11 @@ def run_checks_stdio(cmd: str, spec_index: Dict[str, SpecCheck]) -> List[Finding
         x03 = spec_index.get("X-03")
         if x03:
             tools_list2 = client.send_recv("tools/list", {})
-            tools2 = tools_list2.get("result", {}).get("tools", []) if isinstance(tools_list2, dict) else []
+            tools2 = (
+                tools_list2.get("result", {}).get("tools", [])
+                if isinstance(tools_list2, dict)
+                else []
+            )
             findings.append(security_checks.check_tool_stability(tools, tools2, x03))
 
         # R-01: Resource traversal
@@ -246,8 +281,14 @@ def run_checks_stdio(cmd: str, spec_index: Dict[str, SpecCheck]) -> List[Finding
         r03 = spec_index.get("R-03")
         if r03:
             res_list = client.send_recv("resources/list", {})
-            resources = res_list.get("result", {}).get("resources", []) if isinstance(res_list, dict) else []
-            findings.append(security_checks.check_sensitive_resource_exposure(resources, client.send_recv, r03))
+            resources = (
+                res_list.get("result", {}).get("resources", [])
+                if isinstance(res_list, dict)
+                else []
+            )
+            findings.append(
+                security_checks.check_sensitive_resource_exposure(resources, client.send_recv, r03)
+            )
 
         # X-02: Injection fuzzing
         x02 = spec_index.get("X-02")
@@ -269,8 +310,16 @@ def run_checks_stdio(cmd: str, spec_index: Dict[str, SpecCheck]) -> List[Finding
         p03 = spec_index.get("P-03")
         if p03:
             res_list = client.send_recv("resources/list", {})
-            resources = res_list.get("result", {}).get("resources", []) if isinstance(res_list, dict) else []
-            findings.append(security_checks.check_indirect_prompt_injection(resources, tools, client.send_recv, p03))
+            resources = (
+                res_list.get("result", {}).get("resources", [])
+                if isinstance(res_list, dict)
+                else []
+            )
+            findings.append(
+                security_checks.check_indirect_prompt_injection(
+                    resources, tools, client.send_recv, p03
+                )
+            )
 
     finally:
         client.close()
@@ -278,7 +327,7 @@ def run_checks_stdio(cmd: str, spec_index: Dict[str, SpecCheck]) -> List[Finding
     return findings
 
 
-def get_stdio_health(cmd: str) -> Dict[str, Any]:
+def get_stdio_health(cmd: str) -> dict[str, Any]:
     """Get health information from stdio MCP server (similar to HTTP health check)"""
     health = {
         "target": f"stdio:{cmd}",
@@ -286,7 +335,7 @@ def get_stdio_health(cmd: str) -> Dict[str, Any]:
         "initialize": {},
         "tools": [],
         "prompts": [],
-        "resources": []
+        "resources": [],
     }
 
     try:
@@ -331,8 +380,6 @@ def get_stdio_health(cmd: str) -> Dict[str, Any]:
     return health
 
 
-def scan_stdio(cmd: str, spec_index: Dict[str, SpecCheck]) -> Report:
+def scan_stdio(cmd: str, spec_index: dict[str, SpecCheck]) -> Report:
     findings = run_checks_stdio(cmd, spec_index)
     return Report.new(target=f"stdio:{cmd}", findings=findings)
-
-

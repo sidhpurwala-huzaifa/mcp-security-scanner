@@ -160,6 +160,7 @@ python -m pytest tests/ -v
 
 # Run specific test module
 python -m pytest tests/test_stdio_scanner.py -v
+python -m pytest tests/test_security_checks.py -v
 
 # Run specific test class
 python -m pytest tests/test_stdio_scanner.py::TestStdioIntegration -v
