@@ -584,9 +584,10 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
             ok = isinstance(init_obj, dict) and "result" in init_obj and "capabilities" in init_obj.get("result", {})
             findings.append(_finding(base, ok, json.dumps(init_obj)))
 
-        # tools/list
+        # tools/list (guard against null result)
         tools_list: Dict[str, Any] = rpc("tools/list", {})
-        tools = tools_list.get("result", {}).get("tools", []) if isinstance(tools_list, dict) else []
+        tools_result = (tools_list.get("result") if isinstance(tools_list, dict) else None) or {}
+        tools = tools_result.get("tools", []) if isinstance(tools_result, dict) else []
 
         # RC-01: Remote access control exposure
         rc01 = spec_index.get("RC-01")
@@ -661,7 +662,8 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
             p01_issues: List[Dict[str, Any]] = []
             try:
                 plist = rpc("prompts/list", {})
-                prompts = plist.get("result", {}).get("prompts", []) if isinstance(plist, dict) else []
+                prompts_result = (plist.get("result") if isinstance(plist, dict) else None) or {}
+                prompts = prompts_result.get("prompts", []) if isinstance(prompts_result, dict) else []
                 for pr in prompts or []:
                     name = pr.get("name")
                     schema = pr.get("inputSchema") or {}
@@ -766,7 +768,8 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
 
         # Resources listing
         rlist = rpc("resources/list", {})
-        resources = rlist.get("result", {}).get("resources", []) if isinstance(rlist, dict) else []
+        resources_result = (rlist.get("result") if isinstance(rlist, dict) else None) or {}
+        resources = resources_result.get("resources", []) if isinstance(resources_result, dict) else []
 
         # R-03 sensitive exposure
         r03 = spec_index.get("R-03")
@@ -1442,11 +1445,14 @@ def get_server_health(base_url: str, headers: Optional[Dict[str, str]] = None, t
             status, data = _post_json(msg_url, {"jsonrpc": "2.0", "id": 99, "method": method, "params": params})
             return data if isinstance(data, dict) else {"status": status, "body": data}
         tools_obj = rpc("tools/list", {})
-        tools = tools_obj.get("result", {}).get("tools", []) if isinstance(tools_obj, dict) else []
+        tools_result = (tools_obj.get("result") if isinstance(tools_obj, dict) else None) or {}
+        tools = tools_result.get("tools", []) if isinstance(tools_result, dict) else []
         prompts_obj = rpc("prompts/list", {})
-        prompts = prompts_obj.get("result", {}).get("prompts", []) if isinstance(prompts_obj, dict) else []
+        prompts_result = (prompts_obj.get("result") if isinstance(prompts_obj, dict) else None) or {}
+        prompts = prompts_result.get("prompts", []) if isinstance(prompts_result, dict) else []
         resources_obj = rpc("resources/list", {})
-        resources = resources_obj.get("result", {}).get("resources", []) if isinstance(resources_obj, dict) else []
+        resources_result = (resources_obj.get("result") if isinstance(resources_obj, dict) else None) or {}
+        resources = resources_result.get("resources", []) if isinstance(resources_result, dict) else []
         return {"base_url": base_url, "msg_url": msg_url, "sse_url": None, "initialize": init_obj, "tools": tools, "prompts": prompts, "resources": resources}
     finally:
         client.close()
