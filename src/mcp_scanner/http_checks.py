@@ -9,6 +9,7 @@ from urllib.parse import urlparse, parse_qs
 
 from .models import Finding, Severity
 from .spec import SpecCheck
+from . import security_checks
 
 
 def _finding(spec: SpecCheck, passed: bool, details: str) -> Finding:
@@ -708,24 +709,7 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
             if not tools:
                 findings.append(_finding(x01, passed=True, details="No tools were discovered"))
             else:
-                risky_keywords = [
-                    "exec", "command", "shell", "write_file", "delete", "rm", "chmod", "chown",
-                    "fetch", "http", "url", "eval", "render", "payment", "admin", "privilege",
-                ]
-                risky_tools: List[Dict[str, Any]] = []
-                for t in tools or []:
-                    name = (t.get("name") or "").lower()
-                    desc = (t.get("description") or "").lower()
-                    schema = t.get("inputSchema") or {}
-                    has_constraints = False
-                    if isinstance(schema, dict):
-                        props = schema.get("properties") or {}
-                        for _, p in (props.items() if isinstance(props, dict) else []):
-                            if any(k in p for k in ("enum", "pattern", "minimum", "maximum", "minLength", "maxLength")):
-                                has_constraints = True
-                    if any(k in name or k in desc for k in risky_keywords) and not has_constraints:
-                        risky_tools.append(t)
-                findings.append(_finding(x01, passed=len(risky_tools) == 0, details=json.dumps(risky_tools)))
+                findings.append(security_checks.check_dangerous_capabilities(tools, x01))
 
         # R-01 traversal & R-02 sensitive path
         r01 = spec_index.get("R-01")
