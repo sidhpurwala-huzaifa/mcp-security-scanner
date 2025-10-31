@@ -12,6 +12,7 @@ import pytest
 from src.mcp_scanner.security_checks import (
     check_dangerous_capabilities,
     check_indirect_prompt_injection,
+    check_injection_fuzzing,
     check_prompt_injection_heuristics,
     check_remote_access_control_exposure,
     check_sensitive_resource_exposure,
@@ -362,6 +363,7 @@ class TestDangerousCapabilities:
         assert not result.passed  # Should fail due to dangerous tools
         details = json.loads(result.details)
         assert len(details) == 2  # Both tools should be flagged
+        assert details[0]["reasons"][0]["kind"] == "unconstrained_parameter"
 
     def test_x01_passes_with_constrained_dangerous_tools(self):
         """Test that X-01 passes when dangerous tools have proper constraints."""
@@ -435,6 +437,103 @@ class TestDangerousCapabilities:
         assert result.passed  # Should pass with safe tools
         details = json.loads(result.details)
         assert len(details) == 0  # No tools flagged
+
+    def test_x01_detects_risky_parameter_names_even_without_keyworded_tool(self):
+        """Parameters like `command` should be flagged when unconstrained."""
+
+        spec_index = load_spec()
+        x01_spec = spec_index["X-01"]
+
+        tools = [
+            {
+                "name": "helper",
+                "description": "Perform helpful actions",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "note": {"type": "string", "enum": ["safe"]},
+                    },
+                },
+            }
+        ]
+
+        result = check_dangerous_capabilities(tools, x01_spec)
+
+        assert not result.passed
+        details = json.loads(result.details)
+        assert details[0]["reasons"][0]["parameter"] == "command"
+
+
+class TestInjectionFuzzing:
+    """Test the X-02 injection fuzzing heuristics."""
+
+    def test_x02_detects_command_execution_indicators(self):
+        """Ensure dangerous responses are surfaced with parameter context."""
+
+        spec_index = load_spec()
+        x02_spec = spec_index["X-02"]
+
+        tools = [
+            {
+                "name": "shell_tool",
+                "description": "Execute shell",  # Risky tool
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"input": {"type": "string"}},
+                },
+            }
+        ]
+
+        def mock_send_recv(method: str, params: dict) -> dict:
+            if method == "tools/call" and params["arguments"].get("input") == "; id":
+                return {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "content": [
+                            {"type": "text", "text": "uid=1000 gid=1000"},
+                        ]
+                    },
+                }
+            return {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+        result = check_injection_fuzzing(tools, mock_send_recv, x02_spec)
+
+        assert not result.passed
+        details = json.loads(result.details)
+        assert details[0]["parameter"] == "input"
+        assert details[0]["indicator"] == "uid="
+
+    def test_x02_passes_when_no_indicators_detected(self):
+        """Should return pass when all payloads are rejected or sanitized."""
+
+        spec_index = load_spec()
+        x02_spec = spec_index["X-02"]
+
+        tools = [
+            {
+                "name": "shell_tool",
+                "description": "Execute shell",  # Risky tool
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"input": {"type": "string"}},
+                },
+            }
+        ]
+
+        def mock_send_recv(method: str, params: dict) -> dict:
+            return {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": -32000, "message": "Command rejected"},
+            }
+
+        result = check_injection_fuzzing(tools, mock_send_recv, x02_spec)
+
+        assert result.passed
+        details = json.loads(result.details)
+        assert details == []
 
 
 class TestPromptInjectionHeuristics:
