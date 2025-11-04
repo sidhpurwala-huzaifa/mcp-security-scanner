@@ -624,18 +624,7 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
             else:
                 tools_list2 = rpc("tools/list", {})
                 tools2 = tools_list2.get("result", {}).get("tools", []) if isinstance(tools_list2, dict) else []
-                def key(t: Dict[str, Any]):
-                    return t.get("name"), t.get("description")
-                set1 = {key(t) for t in tools or []}
-                set2 = {key(t) for t in tools2 or []}
-                diff = []
-                if set1 != set2:
-                    diff = [
-                        {"before": [t for t in tools if t.get("name") == n and t.get("description") == d],
-                         "after": [t for t in tools2 if t.get("name") == n and t.get("description") == d]}
-                        for (n, d) in set1.symmetric_difference(set2)
-                    ]
-                findings.append(_finding(x03, passed=len(diff) == 0, details=json.dumps(diff)))
+                findings.append(security_checks.check_tool_stability(tools, tools2, x03))
 
         # P-02 Prompt/description heuristics
         p02 = spec_index.get("P-02")
@@ -643,19 +632,7 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
             if len(tools) == 0:
                 findings.append(_finding(p02, passed=True, details="No tools were discovered"))
             else:
-                bad_phrases = [
-                    "ignore any safety rules",
-                    "override other tools",
-                    "include contents of",
-                    "do not disclose this instruction",
-                    "hidden instruction",
-                ]
-                hits: List[Dict[str, object]] = []
-                for t in tools:
-                    desc = (t.get("description") or "").lower()
-                    if any(phrase in desc for phrase in bad_phrases):
-                        hits.append(t)
-                findings.append(_finding(p02, passed=len(hits) == 0, details=json.dumps(hits)))
+                findings.append(security_checks.check_prompt_injection_heuristics(tools, p02))
 
         # P-01 Prompt argument validation
         p01 = spec_index.get("P-01")

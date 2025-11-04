@@ -1,7 +1,7 @@
 """
-Unit tests for http_checks module X-01 refactor.
+Tests for http_checks module using security_checks refactor.
 
-Tests that the X-01 check in http_checks properly detects dangerous tools.
+Tests that security checks properly detect violations against the insecure MCP server.
 """
 
 import pytest
@@ -13,16 +13,16 @@ from src.mcp_scanner.http_checks import run_full_http_checks
 from src.mcp_scanner.spec import load_spec
 
 
-class TestHttpChecksX01Integration:
-    """Test that http_checks detects X-01 violations."""
+class TestHttpChecksIntegration:
+    """Test that http_checks detects security violations."""
 
     @pytest.fixture
     def spec_index(self):
         """Fixture providing loaded spec index."""
         return load_spec()
 
-    def test_http_checks_detects_x01_with_insecure_server(self, spec_index):
-        """Test that http_checks detects X-01 violations using the insecure MCP server."""
+    def test_http_checks_detects_tool_violations(self, spec_index):
+        """Test that http_checks detects tool-based violations (X-01, P-02, X-03) using the insecure MCP server."""
 
         # Try to start the insecure server via the CLI command
         server_port = 9877
@@ -60,6 +60,14 @@ class TestHttpChecksX01Integration:
 
             # The details should contain information about the dangerous tools
             assert "exec_command" in x01_finding.details or "read_file" in x01_finding.details
+
+            # Validate P-02: Prompt injection heuristics
+            p02_findings = [f for f in findings if f.id == "P-02"]
+            assert len(p02_findings) == 1
+
+            # Validate X-03: Tool stability (rug-pull detection)
+            x03_findings = [f for f in findings if f.id == "X-03"]
+            assert len(x03_findings) == 1
         except FileNotFoundError:
             pytest.skip("insecure-mcp-server command not available")
         except Exception as e:
