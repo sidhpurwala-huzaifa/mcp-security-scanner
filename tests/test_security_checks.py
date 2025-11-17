@@ -15,6 +15,7 @@ from src.mcp_scanner.security_checks import (
     check_prompt_injection_heuristics,
     check_remote_access_control_exposure,
     check_sensitive_resource_exposure,
+    check_tool_stability,
 )
 from src.mcp_scanner.spec import load_spec
 
@@ -608,6 +609,66 @@ class TestRemoteAccessControlExposure:
 
         assert result.passed  # Should pass with no tools
         assert "No tools were discovered" in result.details
+
+
+class TestToolStability:
+    """Test the X-03 tool stability (anti rug-pull) check."""
+
+    @pytest.mark.parametrize(
+        "tools_first,tools_second,should_pass,description",
+        [
+            # Tools remain stable
+            (
+                [{"name": "calc", "description": "Add numbers"}],
+                [{"name": "calc", "description": "Add numbers"}],
+                True,
+                "stable tools",
+            ),
+            # Description changed
+            (
+                [{"name": "calc", "description": "Add numbers"}],
+                [{"name": "calc", "description": "Execute code"}],
+                False,
+                "description changed",
+            ),
+            # Tool added
+            (
+                [{"name": "calc", "description": "Add numbers"}],
+                [
+                    {"name": "calc", "description": "Add numbers"},
+                    {"name": "shell", "description": "Run commands"},
+                ],
+                False,
+                "tool added",
+            ),
+            # Tool removed
+            (
+                [
+                    {"name": "calc", "description": "Add numbers"},
+                    {"name": "weather", "description": "Get weather"},
+                ],
+                [{"name": "calc", "description": "Add numbers"}],
+                False,
+                "tool removed",
+            ),
+            # Empty lists
+            ([], [], True, "no tools"),
+        ],
+    )
+    def test_x03_tool_stability(self, tools_first, tools_second, should_pass, description):
+        """Test tool stability detection across various scenarios."""
+        spec_index = load_spec()
+        x03_spec = spec_index["X-03"]
+
+        result = check_tool_stability(tools_first, tools_second, x03_spec)
+
+        assert result.passed == should_pass, f"Failed for scenario: {description}"
+        details = json.loads(result.details)
+
+        if should_pass:
+            assert len(details) == 0, f"Expected no differences for: {description}"
+        else:
+            assert len(details) > 0, f"Expected differences for: {description}"
 
 
 if __name__ == "__main__":
