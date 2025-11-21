@@ -14,7 +14,15 @@ from src.mcp_scanner.spec import load_spec
 
 
 class TestHttpChecksIntegration:
-    """Test that http_checks detects security violations."""
+    """Test that http_checks detects security violations.
+
+    TODO: Add separate tests for different insecure server modes:
+    - Mode 2: Test P-02 failure (malicious tool descriptions)
+    - Mode 3: Test X-03 failure (rug-pull behavior)
+    - Mode 5: Test A-03 failure (token leak)
+    - Mode 6: Test P-03 (indirect prompt injection)
+    - Mode 7: Test RC-01 (remote access control)
+    """
 
     @pytest.fixture
     def spec_index(self):
@@ -22,7 +30,15 @@ class TestHttpChecksIntegration:
         return load_spec()
 
     def test_http_checks_detects_tool_violations(self, spec_index):
-        """Test that http_checks detects tool-based violations (X-01, P-02, X-03) using the insecure MCP server."""
+        """Test that http_checks detects security violations using the insecure MCP server.
+
+        Uses insecure server in default mode 0, which provides:
+        - Dangerous tools (exec_command, read_file) without constraints
+        - Clean tool descriptions (no prompt injection in metadata)
+        - Stable tool list (no rug-pull behavior)
+        - Vulnerable to injection attacks when tools are called
+        - Allows unauthorized resource access (traversal, /etc/passwd)
+        """
 
         # Try to start the insecure server via the CLI command
         server_port = 9877
@@ -61,13 +77,35 @@ class TestHttpChecksIntegration:
             # The details should contain information about the dangerous tools
             assert "exec_command" in x01_finding.details or "read_file" in x01_finding.details
 
-            # Validate P-02: Prompt injection heuristics
+            # Validate P-02: Prompt injection heuristics (should pass - no malicious prompts in descriptions)
             p02_findings = [f for f in findings if f.id == "P-02"]
             assert len(p02_findings) == 1
+            assert p02_findings[0].passed
 
-            # Validate X-03: Tool stability (rug-pull detection)
+            # Validate X-03: Tool stability (should pass - tools remain stable)
             x03_findings = [f for f in findings if f.id == "X-03"]
             assert len(x03_findings) == 1
+            assert x03_findings[0].passed
+
+            # Validate R-01: Resource traversal (should fail - insecure server allows traversal)
+            r01_findings = [f for f in findings if f.id == "R-01"]
+            assert len(r01_findings) == 1
+            assert not r01_findings[0].passed
+
+            # Validate R-02: Resource access control (should fail - insecure server allows /etc/passwd)
+            r02_findings = [f for f in findings if f.id == "R-02"]
+            assert len(r02_findings) == 1
+            assert not r02_findings[0].passed
+
+            # Validate X-02: Injection fuzzing (should fail - insecure server is vulnerable)
+            x02_findings = [f for f in findings if f.id == "X-02"]
+            assert len(x02_findings) == 1
+            assert not x02_findings[0].passed
+
+            # Validate A-03: Token passthrough (should pass - upstream_access tool not in mode 0)
+            a03_findings = [f for f in findings if f.id == "A-03"]
+            assert len(a03_findings) == 1
+            assert a03_findings[0].passed
         except FileNotFoundError:
             pytest.skip("insecure-mcp-server command not available")
         except Exception as e:
