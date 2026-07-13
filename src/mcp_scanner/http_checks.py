@@ -691,14 +691,10 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         # R-01 traversal & R-02 sensitive path
         r01 = spec_index.get("R-01")
         if r01:
-            attempt = rpc("resources/read", {"uri": "file:///../../etc/hosts"})
-            accepted = isinstance(attempt, dict) and "result" in attempt and isinstance(attempt.get("result"), dict)
-            findings.append(_finding(r01, passed=not accepted, details=json.dumps(attempt)))
+            findings.append(security_checks.check_resource_traversal(rpc, r01))
         r02 = spec_index.get("R-02")
         if r02:
-            attempt2 = rpc("resources/read", {"uri": "file:///etc/passwd"})
-            accepted2 = isinstance(attempt2, dict) and "result" in attempt2 and isinstance(attempt2.get("result"), dict)
-            findings.append(_finding(r02, passed=not accepted2, details=json.dumps(attempt2)))
+            findings.append(security_checks.check_resource_access_control(rpc, r02))
 
         # X-02 fuzz tools/call
         x02 = spec_index.get("X-02")
@@ -706,26 +702,7 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
             if len(tools) == 0:
                 findings.append(_finding(x02, passed=True, details="No tools were discovered"))
             else:
-                payloads = ["; id", "$(whoami)", "`uname - a`", "../../../../etc/passwd", "http://169.254.169.254/latest/meta-data/"]
-                observed: List[Dict[str, Any]] = []
-                for t in tools:
-                    name = t.get("name")
-                    schema = t.get("inputSchema") or {}
-                    props = schema.get("properties") or {}
-                    str_param = None
-                    for pn, p in (props.items() if isinstance(props, dict) else []):
-                        if (p.get("type") == "string"):
-                            str_param = pn
-                            break
-                    if not (name and str_param):
-                        continue
-                    for pl in payloads:
-                        resp = rpc("tools/call", {"name": name, "arguments": {str_param: pl}})
-                        text = json.dumps(resp).lower()
-                        if any(key in text for key in ["uid=", "linux", "root:x:", "etc/passwd", "meta-data", "insecure", "stdout"]):
-                            observed.append({"tool": name, "payload": pl, "resp": resp})
-                            break
-                findings.append(_finding(x02, passed=len(observed) == 0, details=json.dumps(observed)))
+                findings.append(security_checks.check_injection_fuzzing(tools, rpc, x02))
 
         # Resources listing
         rlist = rpc("resources/list", {})
@@ -845,10 +822,7 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         # A-03 token pass-through via tool
         a03 = spec_index.get("A-03")
         if a03:
-            leak = rpc("tools/call", {"name": "upstream_access", "arguments": {"code": "dummy"}})
-            text = json.dumps(leak).lower()
-            leaked = any(k in text for k in ["access_token", "sk-", "token-body", "bearer "])
-            findings.append(_finding(a03, passed=not leaked, details=json.dumps(leak)))
+            findings.append(security_checks.check_token_passthrough(rpc, a03))
 
     finally:
         client.close()

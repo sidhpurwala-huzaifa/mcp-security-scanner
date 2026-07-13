@@ -12,9 +12,13 @@ import pytest
 from src.mcp_scanner.security_checks import (
     check_dangerous_capabilities,
     check_indirect_prompt_injection,
+    check_injection_fuzzing,
     check_prompt_injection_heuristics,
     check_remote_access_control_exposure,
+    check_resource_access_control,
+    check_resource_traversal,
     check_sensitive_resource_exposure,
+    check_token_passthrough,
     check_tool_stability,
 )
 from src.mcp_scanner.spec import load_spec
@@ -669,6 +673,201 @@ class TestToolStability:
             assert len(details) == 0, f"Expected no differences for: {description}"
         else:
             assert len(details) > 0, f"Expected differences for: {description}"
+
+
+class TestResourceTraversal:
+    """Test the R-01 resource traversal check."""
+
+    @pytest.mark.parametrize(
+        "response,should_pass,description",
+        [
+            # Server properly rejects traversal
+            (
+                {"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "Invalid URI"}},
+                True,
+                "rejects traversal",
+            ),
+            # Server accepts traversal (vulnerable)
+            (
+                {"jsonrpc": "2.0", "id": 1, "result": {"contents": [{"type": "text", "text": "127.0.0.1 localhost"}]}},
+                False,
+                "accepts traversal",
+            ),
+            # Server returns error without result
+            (
+                {"jsonrpc": "2.0", "id": 1, "error": {"message": "Access denied"}},
+                True,
+                "denies access",
+            ),
+        ],
+    )
+    def test_r01_resource_traversal(self, response, should_pass, description):
+        """Test resource traversal detection."""
+        spec_index = load_spec()
+        r01_spec = spec_index["R-01"]
+
+        def mock_send_recv(method: str, params: dict) -> dict:
+            assert method == "resources/read"
+            assert params["uri"] == "file:///../../etc/hosts"
+            return response
+
+        result = check_resource_traversal(mock_send_recv, r01_spec)
+
+        assert result.passed == should_pass, f"Failed for: {description}"
+
+
+class TestResourceAccessControl:
+    """Test the R-02 resource access control check."""
+
+    @pytest.mark.parametrize(
+        "response,should_pass,description",
+        [
+            # Server properly rejects sensitive file access
+            (
+                {"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "Access denied"}},
+                True,
+                "denies sensitive file",
+            ),
+            # Server allows access to /etc/passwd (vulnerable)
+            (
+                {"jsonrpc": "2.0", "id": 1, "result": {"contents": [{"type": "text", "text": "root:x:0:0"}]}},
+                False,
+                "allows /etc/passwd access",
+            ),
+            # Server returns empty result (still accepted - fails check)
+            (
+                {"jsonrpc": "2.0", "id": 1, "result": {}},
+                False,
+                "returns empty result",
+            ),
+        ],
+    )
+    def test_r02_resource_access_control(self, response, should_pass, description):
+        """Test resource access control."""
+        spec_index = load_spec()
+        r02_spec = spec_index["R-02"]
+
+        def mock_send_recv(method: str, params: dict) -> dict:
+            assert method == "resources/read"
+            assert params["uri"] == "file:///etc/passwd"
+            return response
+
+        result = check_resource_access_control(mock_send_recv, r02_spec)
+
+        assert result.passed == should_pass, f"Failed for: {description}"
+
+
+class TestInjectionFuzzing:
+    """Test the X-02 injection fuzzing check."""
+
+    def test_x02_detects_command_injection(self):
+        """Test that X-02 detects command injection vulnerabilities."""
+        spec_index = load_spec()
+        x02_spec = spec_index["X-02"]
+
+        tools = [
+            {
+                "name": "exec_tool",
+                "description": "Execute commands",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                },
+            }
+        ]
+
+        def mock_send_recv(method: str, params: dict) -> dict:
+            if method == "tools/call" and params["arguments"].get("command") == "; id":
+                return {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"output": "uid=1000 gid=1000"},
+                }
+            return {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+        result = check_injection_fuzzing(tools, mock_send_recv, x02_spec)
+
+        assert not result.passed
+        details = json.loads(result.details)
+        assert len(details) > 0
+        assert details[0]["tool"] == "exec_tool"
+        assert details[0]["payload"] == "; id"
+
+    def test_x02_passes_with_no_tools(self):
+        """Test that X-02 passes when no tools are available."""
+        spec_index = load_spec()
+        x02_spec = spec_index["X-02"]
+
+        def mock_send_recv(method: str, params: dict) -> dict:
+            return {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+        result = check_injection_fuzzing([], mock_send_recv, x02_spec)
+
+        assert result.passed
+
+    def test_x02_passes_with_sanitized_tools(self):
+        """Test that X-02 passes when tools properly sanitize input."""
+        spec_index = load_spec()
+        x02_spec = spec_index["X-02"]
+
+        tools = [
+            {
+                "name": "safe_tool",
+                "description": "Safe tool",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"input": {"type": "string"}},
+                },
+            }
+        ]
+
+        def mock_send_recv(method: str, params: dict) -> dict:
+            return {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"output": "Input rejected"},
+            }
+
+        result = check_injection_fuzzing(tools, mock_send_recv, x02_spec)
+
+        assert result.passed
+
+
+class TestTokenPassthrough:
+    """Test the A-03 token passthrough check."""
+
+    def test_a03_detects_token_leak(self):
+        """Test that A-03 detects leaked tokens in responses."""
+        spec_index = load_spec()
+        a03_spec = spec_index["A-03"]
+
+        def mock_send_recv(method: str, params: dict) -> dict:
+            return {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"access_token": "sk-1234567890", "status": "authenticated"},
+            }
+
+        result = check_token_passthrough(mock_send_recv, a03_spec)
+
+        assert not result.passed
+        assert "access_token" in result.details
+
+    def test_a03_passes_without_token_leak(self):
+        """Test that A-03 passes when tokens are not leaked."""
+        spec_index = load_spec()
+        a03_spec = spec_index["A-03"]
+
+        def mock_send_recv(method: str, params: dict) -> dict:
+            return {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"status": "success", "data": "some data"},
+            }
+
+        result = check_token_passthrough(mock_send_recv, a03_spec)
+
+        assert result.passed
 
 
 if __name__ == "__main__":
