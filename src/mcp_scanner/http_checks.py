@@ -117,8 +117,7 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         headers=headers or {},
     )
     # Ensure required headers for Streamable HTTP compatibility
-    if "Accept" not in client.headers:
-        client.headers["Accept"] = "application/json, text/event-stream"
+    client.headers["Accept"] = "application/json, text/event-stream"
     client.headers.setdefault("MCP-Protocol-Version", "2025-06-18")
 
     # Cache discovered message URL and working SSE URL (legacy) and allow refresh from inner helpers
@@ -861,7 +860,7 @@ def rpc_call(base_url: str, method: str, params: Dict[str, Any], headers: Option
         timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout),
         headers=headers or {},
     )
-    client.headers.setdefault("Accept", "application/json, text/event-stream")
+    client.headers["Accept"] = "application/json, text/event-stream"
     client.headers.setdefault("MCP-Protocol-Version", "2025-06-18")
 
     msg_url_cache: Optional[str] = None
@@ -1170,7 +1169,7 @@ def get_server_health(base_url: str, headers: Optional[Dict[str, str]] = None, t
         timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout),
         headers=headers or {},
     )
-    client.headers.setdefault("Accept", "application/json, text/event-stream")
+    client.headers["Accept"] = "application/json, text/event-stream"
     client.headers.setdefault("MCP-Protocol-Version", "2025-06-18")
     msg_url_cache: Optional[str] = None
     sse_url_cache: Optional[str] = None
