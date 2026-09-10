@@ -1,28 +1,20 @@
-MCP Security Scanner
+# MCP Security Scanner
 
 This is a Python-based penetration testing tool for Model Context Protocol (MCP) servers. It supports HTTP, stdio, and experimental SSE transports, runs a suite of checks mapped to `scanner_specs.schema` (auth, transport, tools, prompts, resources), and includes a deliberately insecure MCP-like server for testing.
 
 **Legacy HTTP+SSE transport is deprecated; compatibility support is experimental. Streamable HTTP continues to support SSE responses.**
 
-
 ## Install
 
 ### Install a tagged release
 
-Tag `0.1.1` has a known packaging defect: the default scan schema is missing from
-the installed package ([#13](https://github.com/sidhpurwala-huzaifa/mcp-security-scanner/issues/13)).
-The published [`0.1.2` release](https://github.com/sidhpurwala-huzaifa/mcp-security-scanner/releases/tag/0.1.2)
-contains the schema fix. Install it in your virtual environment with:
+Choose a tag from the [releases page](https://github.com/sidhpurwala-huzaifa/mcp-security-scanner/releases).
+In an activated virtual environment, replace `<tag>` with your chosen tag:
 
 ```bash
-python -m pip install --upgrade "git+https://github.com/sidhpurwala-huzaifa/mcp-security-scanner.git@0.1.2"
+python -m pip install --upgrade "git+https://github.com/sidhpurwala-huzaifa/mcp-security-scanner.git@<tag>"
 python -c "from mcp_scanner.spec import load_spec; print(f'Loaded {len(load_spec())} checks')"
 ```
-
-The historical `0.1.2` tag declares package version `0.1.3`; this metadata mismatch
-does not affect schema loading. The tag is preserved as published. This release
-predates the HTTP Accept-header fix in [#17](https://github.com/sidhpurwala-huzaifa/mcp-security-scanner/pull/17);
-use the current source checkout below if you need that fix too.
 
 ### Install from source
 
@@ -58,7 +50,6 @@ both contain the schema, then installs the wheel into a temporary virtual
 environment and loads the default checks outside the checkout. CI runs this check
 on pull requests, main-branch pushes, and tag pushes.
 
-
 ## Usage
 
 ### Scan outcomes and report compatibility
@@ -69,7 +60,7 @@ Reports use `schema_version: 2`. Each finding has an authoritative `status`:
 | --- | --- | --- |
 | `pass` | The check evaluated its evidence and passed | `true` |
 | `fail` | The check evaluated its evidence and failed | `false` |
-| `error` | A prerequisite failed; the check could not be evaluated | `null` |
+| `error` | A prerequisite or probe failed; the check could not be evaluated | `null` |
 | `skipped` | Not evaluated, with the reason in `details` | `null` |
 
 Existing boolean findings can still be read. JSON consumers must handle `null`
@@ -98,7 +89,35 @@ HTTP health output uses `status: "ok"` or `"error"`, `initialize_http_status`,
 `null`; a successfully retrieved empty enumeration is `[]`. `--only-health`
 returns `2` on an error and displays unavailable data explicitly.
 
-These reporting gates are the first part of [#18](https://github.com/sidhpurwala-huzaifa/mcp-security-scanner/issues/18).
+### Active probe outcomes
+
+Active checks classify transport outcomes before examining response text for
+vulnerability evidence. R-01/R-02 and access-control resource/remote probes accept
+HTTP 401/403 as explicit denials; P-01 accepts a well-formed JSON-RPC -32602 error
+for intentionally invalid arguments. Other RPC errors and tool `isError` results
+are inconclusive. A check with any unexpected probe failure is reported as an
+error, even if another attempt in that same check returned data. Independent
+checks still retain their own findings; no request is automatically replayed.
+
+### Diagnostics and redaction
+
+HTTP error diagnostics retain server details with a 16 KiB read limit and the
+existing time budget. Diagnostic summaries are redacted and bounded. Each scan
+keeps an isolated secret set containing supplied credentials and learned session
+identifiers (including legacy endpoint tokens); it is shared with verbose traces
+and final scan/health/RPC output. Redaction occurs after evidence evaluation so
+it does not turn a detected exposure into a pass.
+
+Redaction preserves dictionary keys to keep protocol/report structure intact.
+Short secrets (fewer than eight characters) are matched as complete values or
+word-delimited tokens, avoiding corruption of ordinary words. Recognized secret
+fields and token query parameters remain redacted. Raw and JSON-escaped forms
+are deduplicated and replaced in one pass; existing redaction markers are stable.
+Substring occurrences of short identifiers inside unrelated words are inherently
+ambiguous and are deliberately left unchanged.
+
+### HTTP session handling
+
 Scan, health, and RPC share session handling. `http` selects Streamable HTTP;
 `auto` tries it first and falls back to legacy HTTP+SSE only after an initialize
 POST returns 404 or 405 and a valid legacy endpoint event is received.
@@ -112,21 +131,44 @@ HTTPX network timeouts. This is not a strict wall-clock cancellation deadline.
 Discovery continues probing lists even if not advertised, as this is a scanner.
 Legacy SSE keeps the original GET connection open, posts a real initialize to
 the advertised endpoint, and waits for its correlated response on that connection.
-A legacy endpoint discovery event alone no longer
-counts as verified MCP initialization. Active probes retain structured HTTP/RPC
+A legacy endpoint discovery event alone does not verify MCP initialization. Active probes retain structured HTTP/RPC
 outcomes: unexpected HTTP failures, JSON-RPC errors, tool execution errors, and
 timeouts produce `error` findings rather than security passes. Independent checks
 continue, and incomplete scans retain exit code 2. Check-specific access denials
 and invalid-argument rejections remain distinct from infrastructure errors.
+
+### Legacy HTTP+SSE compatibility
+
+- Discovery uses the supplied SSE URL and its `endpoint` event. Query parameter
+  names such as `sessionId` never select a transport or fabricate a session header.
+- `--sse-endpoint /sse` resolves from the origin root; a relative path resolves
+  against `--url`. `auto` uses it only after HTTP initialization returns 404/405.
+  Authentication failures, other HTTP failures, malformed initialization, and
+  normal RPC failures do not trigger fallback.
+- The advertised endpoint must have the same origin, without embedded credentials
+  or a fragment. Legacy redirects are rejected; supply the final SSE URL directly.
+- Legacy protocol 2024-11-05 initialization, initialized notifications, and normal
+  replies use the original SSE connection. Both message bodies and headers are
+  handled independently of URL query spelling. Health includes the chosen transport.
+- Disconnects, endpoint rotation, missing replies, and invalid initialization
+  produce errors. Connections close on success and failure; calls are not replayed
+  and streams are not automatically resumed. Start a new scan to reconnect.
+- The shared SSE parser handles comments, multiline data, split UTF-8, CR/LF/CRLF,
+  and unrelated events. The 8 MiB bound applies to each Streamable HTTP response
+  and to the lifetime of a legacy receive stream; elapsed budgets are checked
+  between chunks/events alongside network timeouts, not hard wall-clock cancellation.
+
+References: [legacy transport](https://modelcontextprotocol.io/specification/2024-11-05/basic/transports)
+and [Streamable HTTP backwards compatibility](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#backwards-compatibility).
 
 ### Quick test
 ```bash
 # Verify CLI is available
 mcp-scan --help
 
-# Reachability preflight example
+# Connection failure example
 mcp-scan scan --url http://127.0.0.1:65000
-# -> Will fail fast with a clear error if nothing is listening
+# -> Reports an initialization error if nothing is listening
 ```
 
 ### Run insecure test server (HTTP)
@@ -149,7 +191,7 @@ insecure-mcp-server --host 127.0.0.1 --port 9001 --test 0/1/2/3/4/5/6/7
 
 ### Scan the server (HTTP, stdio, or SSE)
 ```bash
-# HTTP: Text report (no discovery; --url is the JSON-RPC endpoint)
+# HTTP: Text report (--url is the MCP endpoint)
 mcp-scan scan --url http://127.0.0.1:9001/mcp --format text
 
 # HTTP: JSON report
@@ -165,7 +207,7 @@ mcp-scan scan --transport stdio --command "npx -y @modelcontextprotocol/server-m
 mcp-scan scan --url https://your-mcp.example.com --transport sse --sse-endpoint /sse --timeout 30 --verbose
 ```
 
-### New: RPC passthrough (Inspector-like)
+### RPC passthrough (Inspector-like)
 **Note: RPC commands only support HTTP and SSE transports, not stdio.**
 
 HTTP scanning, RPC, and health checks set `Accept: application/json, text/event-stream`
@@ -241,7 +283,6 @@ mcp-scan scan \
 - **--timeout <seconds>**: Per-request read timeout (default 12s). Increase for slow streams.
 - **--session-id <SID>**: Pre-established session (`Mcp-Session-Id` header).
 
-
 ## Testing
 
 ### Running Tests
@@ -276,53 +317,4 @@ podman run --rm mcp-scan scan --url ${MCP_SERVER} --format text
 
 ## Acknowledgements
 - Vulnerability ideas inspired by `Damn Vulnerable MCP Server` - https://github.com/harishsg993010/damn-vulnerable-MCP-server
-- Ye Wang from Red Hat for all his help in resolving `init` problems with certain MCP servers
-
-Legacy HTTP+SSE compatibility (issue #18, part 3)
-
-- Discovery uses the supplied SSE URL and its `endpoint` event. Query parameter
-  names such as `sessionId` never select a transport or fabricate a session header.
-- `--sse-endpoint /sse` resolves from the origin root; a relative path resolves
-  against `--url`. `auto` uses it only after HTTP initialization returns 404/405.
-  Authentication failures, other HTTP failures, malformed initialization, and
-  normal RPC failures do not trigger fallback.
-- The advertised endpoint must have the same origin, without embedded credentials
-  or a fragment. Legacy redirects are rejected; supply the final SSE URL directly.
-- Legacy protocol 2024-11-05 initialization, initialized notifications, and normal
-  replies use the original SSE connection. Both message bodies and headers are
-  handled independently of URL query spelling. Health includes the chosen transport.
-- Disconnects, endpoint rotation, missing replies, and invalid initialization
-  produce errors. Connections close on success and failure; calls are not replayed
-  and streams are not automatically resumed. Start a new scan to reconnect.
-- The shared SSE parser handles comments, multiline data, split UTF-8, CR/LF/CRLF,
-  and unrelated events. The 8 MiB bound applies to each Streamable HTTP response
-  and to the lifetime of a legacy receive stream; elapsed budgets are checked
-  between chunks/events alongside network timeouts, not hard wall-clock cancellation.
-
-References: [legacy transport](https://modelcontextprotocol.io/specification/2024-11-05/basic/transports)
-and [Streamable HTTP backwards compatibility](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#backwards-compatibility).
-
-Acceptance follow-up for issue #18
-
-Active checks classify transport outcomes before examining response text for
-vulnerability evidence. R-01/R-02 and access-control resource/remote probes accept
-HTTP 401/403 as explicit denials; P-01 accepts a well-formed JSON-RPC -32602 error
-for intentionally invalid arguments. Other RPC errors and tool `isError` results
-are inconclusive. A check with any unexpected probe failure is reported as an
-error, even if another attempt in that same check returned data. Independent
-checks still retain their own findings; no request is automatically replayed.
-
-HTTP error diagnostics retain server details with a 16 KiB read limit and the
-existing time budget. Diagnostic summaries are redacted and bounded. Each scan
-keeps an isolated secret set containing supplied credentials and learned session
-identifiers (including legacy endpoint tokens); it is shared with verbose traces
-and final scan/health/RPC output. Redaction occurs after evidence evaluation so
-it does not turn a detected exposure into a pass.
-
-Redaction preserves dictionary keys to keep protocol/report structure intact.
-Short secrets (fewer than eight characters) are matched as complete values or
-word-delimited tokens, avoiding corruption of ordinary words. Recognized secret
-fields and token query parameters remain redacted. Raw and JSON-escaped forms
-are deduplicated and replaced in one pass; existing redaction markers are stable.
-Substring occurrences of short identifiers inside unrelated words are inherently
-ambiguous and are deliberately left unchanged.
+- Ye Wang from Red Hat for help with MCP server interoperability
