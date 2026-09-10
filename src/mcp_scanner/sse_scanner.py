@@ -1,4 +1,5 @@
 from __future__ import annotations
+from . import __version__
 
 import json
 from typing import Any, Dict, List, Optional
@@ -69,7 +70,7 @@ def run_checks_sse(base_url: str, spec_index: Dict[str, SpecCheck], trace: Optio
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
-            "params": {"capabilities": {}, "clientInfo": {"name": "mcp-security-scanner", "version": "0.1.0"}},
+            "params": {"capabilities": {}, "clientInfo": {"name": "mcp-security-scanner", "version": __version__}},
         }
         resp = sse_send_receive(base_url, init, trace=trace, verbose=verbose, headers=auth_headers)
         ok = isinstance(resp, dict) and "result" in resp and "capabilities" in resp.get("result", {})
