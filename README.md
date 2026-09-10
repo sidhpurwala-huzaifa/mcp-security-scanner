@@ -113,8 +113,11 @@ Discovery continues probing lists even if not advertised, as this is a scanner.
 Legacy SSE keeps the original GET connection open, posts a real initialize to
 the advertised endpoint, and waits for its correlated response on that connection.
 A legacy endpoint discovery event alone no longer
-counts as verified MCP initialization. Existing active-probe verdict heuristics
-and standalone `rpc` behavior are not changed by these gates.
+counts as verified MCP initialization. Active probes retain structured HTTP/RPC
+outcomes: unexpected HTTP failures, JSON-RPC errors, tool execution errors, and
+timeouts produce `error` findings rather than security passes. Independent checks
+continue, and incomplete scans retain exit code 2. Check-specific access denials
+and invalid-argument rejections remain distinct from infrastructure errors.
 
 ### Quick test
 ```bash
@@ -298,3 +301,28 @@ Legacy HTTP+SSE compatibility (issue #18, part 3)
 
 References: [legacy transport](https://modelcontextprotocol.io/specification/2024-11-05/basic/transports)
 and [Streamable HTTP backwards compatibility](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#backwards-compatibility).
+
+Acceptance follow-up for issue #18
+
+Active checks classify transport outcomes before examining response text for
+vulnerability evidence. R-01/R-02 and access-control resource/remote probes accept
+HTTP 401/403 as explicit denials; P-01 accepts a well-formed JSON-RPC -32602 error
+for intentionally invalid arguments. Other RPC errors and tool `isError` results
+are inconclusive. A check with any unexpected probe failure is reported as an
+error, even if another attempt in that same check returned data. Independent
+checks still retain their own findings; no request is automatically replayed.
+
+HTTP error diagnostics retain server details with a 16 KiB read limit and the
+existing time budget. Diagnostic summaries are redacted and bounded. Each scan
+keeps an isolated secret set containing supplied credentials and learned session
+identifiers (including legacy endpoint tokens); it is shared with verbose traces
+and final scan/health/RPC output. Redaction occurs after evidence evaluation so
+it does not turn a detected exposure into a pass.
+
+Redaction preserves dictionary keys to keep protocol/report structure intact.
+Short secrets (fewer than eight characters) are matched as complete values or
+word-delimited tokens, avoiding corruption of ordinary words. Recognized secret
+fields and token query parameters remain redacted. Raw and JSON-escaped forms
+are deduplicated and replaced in one pass; existing redaction markers are stable.
+Substring occurrences of short identifiers inside unrelated words are inherently
+ambiguous and are deliberately left unchanged.
