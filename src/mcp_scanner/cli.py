@@ -9,7 +9,7 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from .models import Report
+from .models import Report, Outcome
 from .spec import load_spec
 from .http_checks import run_full_http_checks, scan_http_base, get_server_health, rpc_call
 from .stdio_scanner import scan_stdio, get_stdio_health
@@ -46,7 +46,7 @@ def main() -> None:
 @click.option("--command", help="Command to run MCP server (required for stdio transport)")
 def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id: Optional[str], auth_type: Optional[str], auth_token: Optional[str], token_url: Optional[str], client_id: Optional[str], client_secret: Optional[str], scope: Optional[str], output: Optional[str], timeout: float, session_id: Optional[str], transport: str, only_health: bool, sse_endpoint: Optional[str], command: Optional[str]) -> None:
     if verbose and explain_id:
-        console.print("--verbose and --explain are mutually exclusive; using --explain.")
+        click.echo("--verbose and --explain are mutually exclusive; using --explain.", err=fmt == "json")
         verbose = False
 
     # Validate stdio transport requirements
@@ -54,7 +54,7 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
         if not command:
             raise click.ClickException("--command is required when using --transport stdio")
         if url and url != "stdio://command":
-            console.print("Note: --url is ignored when using stdio transport, using provided --command instead")
+            click.echo("Note: --url is ignored when using stdio transport, using provided --command instead", err=fmt == "json")
     else:
         if not url:
             raise click.ClickException("--url is required when not using stdio transport")
@@ -62,7 +62,7 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
             raise click.ClickException("--command can only be used with --transport stdio")
 
     if transport == "sse":
-        console.print("SSE is deprecated in MCP!!! SSE support in the scanner is experimental and may not work!!!")
+        click.echo("SSE is deprecated in MCP!!! SSE support in the scanner is experimental and may not work!!!", err=fmt == "json")
     class RealtimeTrace:
         def __init__(self, c: Console) -> None:
             self._c = c
@@ -127,7 +127,8 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
             with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout)) as _c:
                 _c.get(url, timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout))
         except httpx.RequestError as e:  # noqa: PERF203
-            raise click.ClickException(f"Cannot reach MCP server at {url}: {type(e).__name__}: {e}")
+            click.echo(f"Cannot reach MCP server at {url}: {type(e).__name__}: {e}", err=True)
+            sys.exit(2)
 
     spec_file = Path(spec) if spec else None
     if spec_file is not None:
@@ -146,9 +147,8 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
         else:
             health = get_server_health(url, headers=auth_headers, trace=trace, verbose=verbose, timeout=timeout, transport=transport, sse_endpoint=sse_endpoint)
         if fmt == "json":
-            console.rule("Health (JSON)")
-            console.print_json(json.dumps(health))
-            return
+            click.echo(json.dumps(health, indent=2))
+            sys.exit(2 if health.get("status") == "error" or "error" in health else 0)
         # Text output
         console.rule("Health")
 
@@ -166,6 +166,8 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
             console.print(f"Base URL: {base}")
             console.print(f"Message endpoint: {msg_url}")
             console.print(f"SSE URL: {sse_url}")
+            for operation, error in health.get("errors", {}).items():
+                console.print(f"{operation}: {error}", markup=False)
 
         init_obj = health.get("initialize") or {}
         tools = health.get("tools") or []
@@ -182,7 +184,7 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
             for t in tools:
                 ttable.add_row(str(t.get("name", "")), (t.get("description") or ""))
         else:
-            ttable.add_row("-", "No tools discovered")
+            ttable.add_row("-", "Unavailable (not evaluated)" if health.get("tools") is None else "No tools discovered")
         console.print(ttable)
         # Prompts table
         ptable = Table(title="Prompts")
@@ -193,7 +195,7 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
                 req = ",".join(p.get("inputSchema", {}).get("required", []) if isinstance(p.get("inputSchema"), dict) else [])
                 ptable.add_row(str(p.get("name", "")), req)
         else:
-            ptable.add_row("-", "No prompts discovered")
+            ptable.add_row("-", "Unavailable (not evaluated)" if health.get("prompts") is None else "No prompts discovered")
         console.print(ptable)
         # Resources table
         rtable = Table(title="Resources")
@@ -204,9 +206,9 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
             for r in resources:
                 rtable.add_row(str(r.get("name", "")), str(r.get("uri", "")), str(r.get("uriTemplate", "")))
         else:
-            rtable.add_row("-", "No resources discovered", "")
+            rtable.add_row("-", "Unavailable (not evaluated)" if health.get("resources") is None else "No resources discovered", "")
         console.print(rtable)
-        return
+        sys.exit(2 if health.get("status") == "error" or "error" in health else 0)
 
     # Run scanning based on transport type
     if transport == "stdio":
@@ -221,18 +223,18 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
         out = report.model_dump_json(indent=2)
         if output:
             Path(output).write_text(out)
-            console.print(f"Wrote JSON report to {output}")
+            click.echo(f"Wrote JSON report to {output}", err=True)
         else:
-            console.print(out)
+            click.echo(out)
     else:
         table = Table(title=f"MCP Security Scan: {report.target}")
         table.add_column("ID")
         table.add_column("Title")
         table.add_column("Severity")
-        table.add_column("Pass")
+        table.add_column("Status")
         table.add_column("Details")
         for f in report.findings:
-            table.add_row(f.id, f.title, f.severity.value, "✅" if f.passed else "❌", (f.details[:120] + "...") if len(f.details) > 120 else f.details)
+            table.add_row(f.id, f.title, f.severity.value, f.status.value.upper(), (f.details[:120] + "...") if len(f.details) > 120 else f.details)
         console.print(table)
         console.print(f"Summary: {report.summary}")
         if explain_id:
@@ -243,13 +245,17 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
             else:
                 for line in _explain_single(f, spec_index, list(trace) if isinstance(trace, list) else []):
                     console.print(f"- {line}")
-    failed = [f for f in report.findings if not f.passed]
-    if failed:
-        console.print(f"[red]Scan failed: {len(failed)} findings[/red]")
-        sys.exit(1)
+    totals = report.summary
+    if totals["errors"]:
+        message = f"Scan incomplete: {totals['errors']} errors; {totals['failed']} failed checks"
+    elif totals["failed"]:
+        message = f"Scan failed: {totals['failed']} findings"
+    elif totals["skipped"]:
+        message = f"Scan completed: {totals['passed']} passed; {totals['skipped']} skipped"
     else:
-        console.print("[green]All checks passed[/green]")
-        sys.exit(0)
+        message = "All checks passed"
+    click.echo(message, err=fmt == "json")
+    sys.exit(report.exit_code)
 
 @main.command("scan-range")
 @click.option("--host", required=True, help="Target host, e.g., localhost")
@@ -276,17 +282,20 @@ def scan_range_cmd(host: str, ports: str, scheme: str, spec: Optional[str], verb
     table = Table(title=f"Scan range {scheme} on {host}:{ports}")
     table.add_column("Target")
     table.add_column("Findings summary")
+    exit_code = 0
     for p in ports_list:
         trace: list[dict] = [] if (verbose or explain) else []
         base = f"{scheme}://{host}:{p}"
         findings = run_full_http_checks(base, spec_index, trace=trace, verbose=verbose, timeout=timeout, transport="auto")
-        passed = sum(1 for f in findings if f.passed)
-        failed = sum(1 for f in findings if not f.passed)
-        table.add_row(base, f"passed={passed} failed={failed}")
+        report = Report.new(base, findings)
+        totals = report.summary
+        exit_code = max(exit_code, report.exit_code)
+        table.add_row(base, " ".join(f"{key}={totals[key]}" for key in ("passed", "failed", "errors", "skipped")))
     console.print(table)
     if explain:
         console.rule("Explanation")
         console.print("Re-run single-target scan with --explain for detailed narrative.")
+    sys.exit(exit_code)
 
 
 def _explain_single(finding, spec_index: Dict[str, Any], trace: list[dict]) -> list[str]:
@@ -294,6 +303,10 @@ def _explain_single(finding, spec_index: Dict[str, Any], trace: list[dict]) -> l
     spec = spec_index.get(finding.id)
     test_name = f"{finding.id} - {finding.title}"
     lines.append(f"Test: {test_name}")
+    if finding.status in (Outcome.error, Outcome.skipped):
+        lines.append(f"Result: {finding.status.value.upper()} — check was not evaluated.")
+        lines.append(f"Reason: {finding.details}")
+        return lines
     # Expected outcome heuristics per ID
     expected = "Per spec: server should enforce safe behavior."
     if finding.id == "A-01":
@@ -372,5 +385,3 @@ def rpc_cmd(url: str, method: str, params: str, header: list[str], transport: st
     trace: Any = []
     result = rpc_call(url, method, params_obj, headers=headers, trace=trace, verbose=verbose, timeout=timeout, transport=transport, sse_endpoint=sse_endpoint)
     console.print_json(json.dumps(result))
-
-

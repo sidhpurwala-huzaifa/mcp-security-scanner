@@ -61,6 +61,49 @@ on pull requests, main-branch pushes, and tag pushes.
 
 ## Usage
 
+### Scan outcomes and report compatibility
+
+Reports use `schema_version: 2`. Each finding has an authoritative `status`:
+
+| Status | Meaning | Compatibility field `passed` |
+| --- | --- | --- |
+| `pass` | The check evaluated its evidence and passed | `true` |
+| `fail` | The check evaluated its evidence and failed | `false` |
+| `error` | A prerequisite failed; the check could not be evaluated | `null` |
+| `skipped` | Not evaluated, with the reason in `details` | `null` |
+
+Existing boolean findings can still be read. JSON consumers must handle `null`
+and use `status` instead of treating every false-like `passed` value as a
+vulnerability. JSON summaries count `passed`, `failed`, `errors`, and `skipped`
+separately; severity totals count only failed checks.
+
+HTTP scans stop dependent probes when initialization fails, report a `BASE-01`
+error even if a custom spec omits that check, and skip the dependent checks.
+Independent TLS/Origin/bind and OAuth-metadata checks can still run. Failed or
+malformed tool, prompt, and resource enumerations produce errors for the checks
+that require them. Successful empty enumerations produce explicit skips rather
+than security passes. A failed second tool listing is an error, not evidence of
+a rug pull. Paginated results with more pages are treated as incomplete until
+full enumeration support is implemented.
+
+Exit codes for `scan` and `scan-range` are `0` for completion without failures or
+errors, `1` for evaluated failures, and `2` for incomplete scans with errors
+(errors take precedence over failures). Expected empty-result skips alone do not
+make a scan incomplete. CLI argument errors can also return `2`. Scan summaries
+go to stderr in JSON mode so stdout remains the report; verbose traces are human
+diagnostics and should not be combined with machine parsing.
+
+HTTP health output uses `status: "ok"` or `"error"`, `initialize_http_status`,
+`enumeration_status`, and an `errors` mapping. An unavailable enumeration is
+`null`; a successfully retrieved empty enumeration is `[]`. `--only-health`
+returns `2` on an error and displays unavailable data explicitly.
+
+These reporting gates are the first part of [#18](https://github.com/sidhpurwala-huzaifa/mcp-security-scanner/issues/18).
+Shared transport parsing, full initialization negotiation, and legacy transport
+repair remain separate work. A legacy endpoint discovery event alone no longer
+counts as verified MCP initialization. Existing active-probe verdict heuristics
+and standalone `rpc` behavior are not changed by these gates.
+
 ### Quick test
 ```bash
 # Verify CLI is available
