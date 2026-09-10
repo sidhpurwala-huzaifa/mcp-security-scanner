@@ -9,6 +9,7 @@ from src.mcp_scanner import http_checks
 from src.mcp_scanner.spec import load_spec
 
 
+@pytest.mark.parametrize("url", ["https://example.test/mcp", "https://example.test/mcp?sessionId=ordinary-query"])
 @pytest.mark.parametrize("entry_point", ["scan", "rpc", "health"])
 @pytest.mark.parametrize("transport", ["auto", "http"])
 @pytest.mark.parametrize("response_type", ["json", "sse"])
@@ -19,7 +20,7 @@ from src.mcp_scanner.spec import load_spec
     {"aCcEpT": "application/json, text/event-stream"},
 ])
 def test_mcp_posts_accept_json_and_sse(
-    monkeypatch, entry_point, transport, response_type, accept_headers
+    monkeypatch, entry_point, transport, response_type, accept_headers, url
 ):
     requests = []
     tools = [{"name": "example", "description": "Example tool", "inputSchema": {}}]
@@ -60,7 +61,6 @@ def test_mcp_posts_accept_json_and_sse(
     monkeypatch.setattr(http_checks.httpx, "Client", mock_client)
     headers = {**accept_headers, "Authorization": "Bearer test-token", "X-Test": "keep"}
     original_headers = headers.copy()
-    url = "https://example.test/mcp"
     if entry_point == "scan":
         spec = load_spec()
         result = http_checks.run_full_http_checks(
