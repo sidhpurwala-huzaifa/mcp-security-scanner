@@ -20,7 +20,7 @@ def selected(*keys):
 def reply(payload, result=None, status=200):
     if result is None:
         method = payload["method"]
-        result = {"capabilities": {}} if method == "initialize" else {method.split("/")[0]: []}
+        result = {"protocolVersion": "2025-06-18", "serverInfo": {"name": "test", "version": "1"}, "capabilities": {}} if method == "initialize" else {method.split("/")[0]: []}
     return httpx.Response(status, json={"jsonrpc": "2.0", "id": payload["id"], "result": result})
 
 
@@ -35,6 +35,8 @@ def endpoint(monkeypatch):
             # The CLI reachability preflight is not an MCP enumeration.
             if request.method == "GET":
                 return httpx.Response(200, json={"token_endpoint": "token", "authorization_endpoint": "auth"})
+            if json.loads(request.content).get("method") == "notifications/initialized":
+                return httpx.Response(202)
             return handler(json.loads(request.content))
 
         monkeypatch.setattr(http_checks.httpx, "Client", lambda **kw: real_client(
@@ -198,7 +200,7 @@ def test_diagnostics_redact_supplied_credentials(endpoint):
     trace = []
     result = http_checks.get_server_health("https://example.test/mcp", headers={"Authorization": "Bearer private-token"}, trace=trace, verbose=True)
     assert "private-token" not in json.dumps(result)
-    assert "[redacted]" in result["errors"]["initialize"]
+    assert "HTTP 401" in result["errors"]["initialize"]
     assert "private-token" not in json.dumps(trace)
 
 
@@ -292,12 +294,12 @@ def test_legacy_warning_does_not_pollute_json_stdout(endpoint, health):
     assert "experimental" in result.stderr
 
 
-def test_preflight_connection_failure_has_incomplete_exit_code(monkeypatch):
+def test_connection_failure_has_incomplete_json_report(monkeypatch):
     real_client = httpx.Client
     def handle(request):
         raise httpx.ConnectError("unreachable")
     monkeypatch.setattr(cli.httpx, "Client", lambda **kw: real_client(**kw, transport=httpx.MockTransport(handle)))
     result = CliRunner().invoke(cli.main, ["scan", "--url", "https://example.test/mcp", "--format", "json"])
     assert result.exit_code == 2
-    assert result.stdout == ""
-    assert "Cannot reach MCP server" in result.stderr
+    report = json.loads(result.stdout)
+    assert report["summary"]["errors"] > 0

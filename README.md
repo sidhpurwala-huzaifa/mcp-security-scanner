@@ -99,8 +99,16 @@ HTTP health output uses `status: "ok"` or `"error"`, `initialize_http_status`,
 returns `2` on an error and displays unavailable data explicitly.
 
 These reporting gates are the first part of [#18](https://github.com/sidhpurwala-huzaifa/mcp-security-scanner/issues/18).
-Shared transport parsing, full initialization negotiation, and legacy transport
-repair remain separate work. A legacy endpoint discovery event alone no longer
+Scan, health, and RPC share a Streamable HTTP session for `auto` and `http`.
+The session accepts JSON or SSE, correlates response IDs, negotiates protocol
+2025-06-18 or 2025-03-26, propagates session/version headers, and sends
+`notifications/initialized` before normal requests. It advertises no optional
+client capabilities. Requests are never automatically replayed after failure.
+SSE responses close as soon as the matching result arrives. Response data is
+limited to 8 MiB, with an elapsed budget checked between response chunks and
+HTTPX network timeouts. This is not a strict wall-clock cancellation deadline.
+Discovery continues probing lists even if not advertised, as this is a scanner.
+Legacy transport repair remains separate work. A legacy endpoint discovery event alone no longer
 counts as verified MCP initialization. Existing active-probe verdict heuristics
 and standalone `rpc` behavior are not changed by these gates.
 
