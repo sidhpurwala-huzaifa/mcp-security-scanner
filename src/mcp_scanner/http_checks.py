@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .streamable_http import StreamableHttpSession
 
 from typing import Dict, List, Optional, Any, Tuple
 import json
@@ -115,6 +116,21 @@ def _enumeration_problem(status: int, data: Any, key: str) -> Optional[str]:
         for item in items
     ):
         return f"HTTP {status}; missing or malformed {key} list"
+    for item in items:
+        for field in ("description", "name", "uri", "mimeType"):
+            if field in item and not isinstance(item[field], str):
+                return f"HTTP {status}; malformed {key} {field}"
+        if "inputSchema" in item:
+            schema = item["inputSchema"]
+            if not isinstance(schema, dict):
+                return f"HTTP {status}; malformed {key} inputSchema"
+            props = schema.get("properties", {})
+            required = schema.get("required", [])
+            if (not isinstance(props, dict)
+                    or any(not isinstance(v, dict) for v in props.values())
+                    or not isinstance(required, list)
+                    or any(not isinstance(v, str) for v in required)):
+                return f"HTTP {status}; malformed {key} inputSchema properties or required"
     if data["result"].get("nextCursor"):
         return f"HTTP {status}; incomplete {key} enumeration (additional pages required)"
     return None
@@ -218,6 +234,7 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         headers=headers or {},
     )
     _set_mcp_http_headers(client)
+    session = StreamableHttpSession(client, base_url, timeout, trace if verbose else None)
 
     # Cache discovered message URL and working SSE URL (legacy) and allow refresh from inner helpers
     msg_url_cache: Optional[str] = None
@@ -382,6 +399,13 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
                     return {"error": "Timeout waiting for SSE response"}
 
     def _post_json(url: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
+        if transport != "sse":
+            if payload.get("id") == 99:
+                status, data = session.call(payload["method"], payload.get("params", {}))
+                if isinstance(data, dict) and "id" in data:
+                    data = {**data, "id": 99}  # Already correlated by the session.
+                return status, data
+            return session.exchange(payload)
         nonlocal msg_url_cache
         nonlocal sse_url_cache
         last_exc: Optional[Exception] = None
@@ -479,6 +503,14 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         nonlocal sse_url_cache, init_status, init_error
         init_status = None
         init_error = None
+        if transport != "sse":
+            try:
+                init_status, data = session.initialize()
+                return base_url, data
+            except Exception as exc:
+                init_status = session.initialize_status
+                init_error = f"HTTP {init_status}; {type(exc).__name__}: {exc}"
+                return None, {}
         # Use only the provided URL(s); no alternate probing
         if transport == "sse":
             sse_url = (base_url.rstrip("/") + sse_endpoint) if sse_endpoint else base_url
@@ -547,41 +579,7 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
                 return None, {}
             return None, {}
         # HTTP: use provided base_url directly
-        init_payload = {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {"sampling": {}, "elicitation": {}, "roots": {"listChanged": True}}, "clientInfo": {"name": "mcp-security-scanner", "version": "0.16.5"}}}
-        try:
-            if verbose and trace is not None:
-                trace.append({"transport": "http", "direction": "send", "request": init_payload, "url": base_url, "note": "initialize"})
-            # Stream response to handle servers that reply with text/event-stream for initialize
-            with client.stream("POST", base_url, json=init_payload) as r:
-                init_status = r.status_code
-                ctype = r.headers.get("content-type", "")
-                if "text/event-stream" in ctype:
-                    data_obj = _parse_sse_response(r) or {}
-                else:
-                    raw = r.read()
-                    try:
-                        data_obj = json.loads(raw)
-                    except Exception:
-                        try:
-                            data_obj = raw.decode("utf-8", errors="replace")
-                        except Exception:
-                            data_obj = str(raw)
-                if verbose and trace is not None:
-                    entry = {"transport": "http", "direction": "recv", "status": r.status_code, "headers": dict(r.headers)}
-                    if isinstance(data_obj, (dict, list)):
-                        entry["data"] = data_obj
-                    else:
-                        entry["data"] = str(data_obj)[:500]
-                    trace.append(entry)
-                sid = r.headers.get("Mcp-Session-Id")
-                if isinstance(sid, str) and sid:
-                    client.headers["Mcp-Session-Id"] = sid
-                    if verbose and trace is not None:
-                        trace.append({"transport": "http", "direction": "info", "note": "session id set", "session_id": sid})
-            return base_url, data_obj if isinstance(data_obj, dict) else {}
-        except Exception as exc:
-            init_error = _diagnostic(f"{type(exc).__name__}: {exc}", headers)
-            return base_url, {}
+        return None, {}
 
     def _refine_with_capabilities(curr_url: str, init_obj: Dict[str, Any]) -> str:
         # Extract path-like strings and probe {cap}, {cap}/message, {cap}/list
@@ -672,17 +670,17 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         if t03:
             try:
                 # For legacy SSE sessions, skip tampering to avoid invalidating the server session
-                if "sessionId=" in (msg_url_cache or ""):
+                if transport == "sse":
                     findings.append(_unevaluated(t03, Outcome.skipped, "Session tampering skipped on legacy-style endpoint"))
                 else:
                     status_init, _ = _post_json(msg_url_cache, {"jsonrpc": "2.0", "id": 4, "method": "initialize", "params": {}})
                     sess_ok = status_init < 500
-                    bad_headers = dict(client.headers)
-                    if "Mcp-Session-Id" not in bad_headers:
-                        bad_headers["Mcp-Session-Id"] = "tampered-session"
+                    bad_headers = httpx.Headers(client.headers)
+                    bad_headers["Mcp-Session-Id"] = "tampered-session"
                     if verbose and trace is not None:
                         trace.append({"transport": "http", "direction": "send", "request": {"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}, "url": msg_url_cache, "note": "altered session id"})
-                    bad = client.post(msg_url_cache, json={"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}, headers=bad_headers)
+                    with client.stream("POST", msg_url_cache, json={"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}, headers=bad_headers) as bad:
+                        pass  # This probe needs only the status, never an open SSE body.
                     rejects_bad = bad.status_code in (401, 403, 400)
                     findings.append(_finding(t03, passed=(sess_ok and rejects_bad), details=f"bad_status={bad.status_code}"))
             except Exception as e:
@@ -981,12 +979,15 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
 
 
 def rpc_call(base_url: str, method: str, params: Dict[str, Any], headers: Optional[Dict[str, str]] = None, trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False, timeout: float = 12.0, transport: str = "auto", sse_endpoint: Optional[str] = None) -> Dict[str, Any]:
+    if trace is not None:
+        trace = _RedactedTrace(trace, headers)
     client = httpx.Client(
         follow_redirects=True,
         timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout),
         headers=headers or {},
     )
     _set_mcp_http_headers(client)
+    session = StreamableHttpSession(client, base_url, timeout, trace if verbose else None)
 
     msg_url_cache: Optional[str] = None
     sse_url_cache: Optional[str] = None
@@ -1136,6 +1137,13 @@ def rpc_call(base_url: str, method: str, params: Dict[str, Any], headers: Option
                     return {"error": "Timeout waiting for SSE response"}
 
     def _post_json(url: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
+        if transport != "sse":
+            if payload.get("id") == 99:
+                status, data = session.call(payload["method"], payload.get("params", {}))
+                if isinstance(data, dict) and "id" in data:
+                    data = {**data, "id": 99}  # Already correlated by the session.
+                return status, data
+            return session.exchange(payload)
         nonlocal msg_url_cache
         nonlocal sse_url_cache
         last_exc: Optional[Exception] = None
@@ -1186,27 +1194,6 @@ def rpc_call(base_url: str, method: str, params: Dict[str, Any], headers: Option
         return 598, {"error": "Unknown error without exception"}
 
     def _discover_endpoint() -> Tuple[Optional[str], Dict[str, Any]]:
-        # base POST initialize (streamable HTTP)
-        if transport != "sse":
-            init_payload = {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {"sampling": {}, "elicitation": {}, "roots": {"listChanged": True}}, "clientInfo": {"name": "mcp-security-scanner", "version": "0.16.5"}}}
-            for u in [base_url]:
-                try:
-                    if verbose and trace is not None:
-                        trace.append({"transport": "http", "direction": "send", "request": init_payload, "url": u, "note": "initialize"})
-                    r = client.post(u, json=init_payload)
-                    try:
-                        data = r.json()
-                    except Exception:
-                        data = r.text
-                    if verbose and trace is not None:
-                        trace.append({"transport": "http", "direction": "recv", "status": r.status_code, "data": data, "headers": dict(r.headers)})
-                    if isinstance(data, dict):
-                        sid = r.headers.get("Mcp-Session-Id")
-                        if isinstance(sid, str) and sid:
-                            client.headers["Mcp-Session-Id"] = sid
-                        return u, data
-                except Exception:
-                    continue
         # legacy HTTP+SSE handshake (explicit URL only)
         if transport in ("sse", "auto"):
             sse_url = (base_url.rstrip("/") + sse_endpoint) if (transport == "sse" and sse_endpoint) else base_url
@@ -1270,6 +1257,13 @@ def rpc_call(base_url: str, method: str, params: Dict[str, Any], headers: Option
         return None, {}
 
     try:
+        if transport != "sse":
+            try:
+                session.initialize()
+                status, data = session.call(method, params)
+                return data if isinstance(data, dict) else {"status": status, "body": data}
+            except Exception as exc:
+                return {"error": _diagnostic(f"{type(exc).__name__}: {exc}", headers)}
         msg_url, init_obj = _discover_endpoint()
         if msg_url is None:
             return {"error": "No endpoint discovered"}
@@ -1302,6 +1296,7 @@ def get_server_health(base_url: str, headers: Optional[Dict[str, str]] = None, t
         headers=headers or {},
     )
     _set_mcp_http_headers(client)
+    session = StreamableHttpSession(client, base_url, timeout, trace if verbose else None)
     msg_url_cache: Optional[str] = None
     sse_url_cache: Optional[str] = None
     # Persistent SSE state for legacy servers
@@ -1408,6 +1403,13 @@ def get_server_health(base_url: str, headers: Optional[Dict[str, str]] = None, t
                     return {"error": "Unable to reopen SSE stream"}
 
     def _post_json(url: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
+        if transport != "sse":
+            if payload.get("id") == 99:
+                status, data = session.call(payload["method"], payload.get("params", {}))
+                if isinstance(data, dict) and "id" in data:
+                    data = {**data, "id": 99}  # Already correlated by the session.
+                return status, data
+            return session.exchange(payload)
         post_headers = None
         if "sessionId=" in url:
             post_headers = dict(client.headers)
@@ -1437,37 +1439,14 @@ def get_server_health(base_url: str, headers: Optional[Dict[str, str]] = None, t
         nonlocal init_status, init_error
         init_status = None
         init_error = None
-        # base POST initialize (streamable HTTP)
         if transport != "sse":
-            init_payload = {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {"sampling": {}, "elicitation": {}, "roots": {"listChanged": True}}, "clientInfo": {"name": "mcp-security-scanner", "version": "0.16.5"}}}
-            for u in [base_url]:
-                try:
-                    if verbose and trace is not None:
-                        trace.append({"transport": "http", "direction": "send", "request": init_payload, "url": u, "note": "initialize"})
-                    # Stream to support SSE initialize responses
-                    with client.stream("POST", u, json=init_payload) as r:
-                        init_status = r.status_code
-                        if "text/event-stream" in r.headers.get("content-type", ""):
-                            data = _parse_sse_response(r) or {}
-                        else:
-                            raw = r.read()
-                            try:
-                                data = json.loads(raw)
-                            except Exception:
-                                try:
-                                    data = raw.decode("utf-8", errors="replace")
-                                except Exception:
-                                    data = str(raw)
-                    if verbose and trace is not None:
-                        trace.append({"transport": "http", "direction": "recv", "status": r.status_code, "data": data, "headers": dict(r.headers)})
-                    if isinstance(data, dict):
-                        sid = r.headers.get("Mcp-Session-Id")
-                        if isinstance(sid, str) and sid:
-                            client.headers["Mcp-Session-Id"] = sid
-                        return u, data
-                except Exception as exc:
-                    init_error = _diagnostic(f"{type(exc).__name__}: {exc}", headers)
-                    continue
+            try:
+                init_status, data = session.initialize()
+                return base_url, data
+            except Exception as exc:
+                init_status = session.initialize_status
+                init_error = f"HTTP {init_status}; {type(exc).__name__}: {exc}"
+                return None, {}
         # legacy HTTP+SSE handshake (explicit URL only)
         if transport in ("sse", "auto"):
             sse_url = (base_url.rstrip("/") + sse_endpoint) if (transport == "sse" and sse_endpoint) else base_url

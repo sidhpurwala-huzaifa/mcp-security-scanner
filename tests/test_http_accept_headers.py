@@ -31,8 +31,10 @@ def test_mcp_posts_accept_json_and_sse(
             return httpx.Response(406, json={"error": "Client must accept JSON and SSE"})
         payload = json.loads(request.content)
         method = payload["method"]
+        if method == "notifications/initialized":
+            return httpx.Response(202)
         if method == "initialize":
-            result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}
+            result = {"protocolVersion": "2025-06-18", "serverInfo": {"name": "test", "version": "1"}, "capabilities": {"tools": {}}}
         elif method == "tools/list":
             result = {"tools": tools}
         elif method == "prompts/list":
@@ -43,9 +45,7 @@ def test_mcp_posts_accept_json_and_sse(
             return httpx.Response(400, json={"error": "Unexpected method"})
         data = {"jsonrpc": "2.0", "id": payload["id"], "result": result}
         headers = {"Mcp-Session-Id": "test-session"} if method == "initialize" else {}
-        # rpc_call's existing initialize parser only supports JSON; SSE initialize
-        # support is a separate issue. Its subsequent RPC still exercises SSE here.
-        if response_type == "sse" and not (entry_point == "rpc" and method == "initialize"):
+        if response_type == "sse":
             return httpx.Response(
                 200, headers={**headers, "Content-Type": "text/event-stream"},
                 content=f"event: message\ndata: {json.dumps(data)}\n\n",

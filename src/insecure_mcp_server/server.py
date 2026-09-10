@@ -46,7 +46,8 @@ async def handle_message(msg: Dict[str, Any]) -> Dict[str, Any]:
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
-                "protocolVersion": "1.0",
+                "protocolVersion": "2025-06-18",
+                "serverInfo": {"name": "insecure-mcp-server", "version": "1"},
                 "capabilities": {"endpoint": "/rpc", "tools": {}, "resources": {}},
                 "sessionId": "insecure-session",
             },
@@ -298,6 +299,9 @@ async def _rpc_endpoint(request: Request) -> JSONResponse:
         msg = await request.json()
     except Exception:  # noqa: BLE001
         return JSONResponse({"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}}, status_code=400)
+    if isinstance(msg, dict) and msg.get("method") == "notifications/initialized" and "id" not in msg:
+        from starlette.responses import Response
+        return Response(status_code=202)
     resp = await handle_message(msg if isinstance(msg, dict) else {})
     return JSONResponse(resp)
 

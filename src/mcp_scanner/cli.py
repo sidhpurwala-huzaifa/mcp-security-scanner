@@ -119,17 +119,10 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
     if session_id:
         auth_headers = {**auth_headers, "Mcp-Session-Id": session_id}
 
-    # Preflight reachability check for HTTP/HTTPS transports only
+    # Validate URL; initialization reports reachability failures in the report.
     if transport != "stdio":
         if not (url.lower().startswith("http://") or url.lower().startswith("https://")):
             raise click.ClickException("--url must start with http:// or https://")
-        try:
-            with httpx.Client(follow_redirects=True, timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout)) as _c:
-                _c.get(url, timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout))
-        except httpx.RequestError as e:  # noqa: PERF203
-            click.echo(f"Cannot reach MCP server at {url}: {type(e).__name__}: {e}", err=True)
-            sys.exit(2)
-
     spec_file = Path(spec) if spec else None
     if spec_file is not None:
         spec_index = load_spec(spec_file)
