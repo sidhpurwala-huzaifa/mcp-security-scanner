@@ -1,0 +1,28 @@
+name: Check Python distributions
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Build source distribution and wheel
+        run: |
+          python -m pip install build
+          # The default build creates the wheel from the sdist, checking both paths.
+          python -m build
+      - name: Verify bundled schema in an isolated installation
+        run: python scripts/check_distribution.py dist
