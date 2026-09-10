@@ -272,8 +272,9 @@ def test_legacy_endpoint_event_is_not_a_successful_initialization(monkeypatch):
     monkeypatch.setattr(http_checks.httpx, "Client", lambda **kw: real_client(**kw, transport=httpx.MockTransport(handle)))
     findings = http_checks.run_full_http_checks("https://example.test", selected("BASE-01", "X-01"), transport="sse")
     assert [f.status for f in findings] == [Outcome.error, Outcome.skipped]
-    assert "not a verified MCP initialization" in findings[0].details
-    assert [request.method for request in requests] == ["GET"]
+    assert "SSE stream closed" in findings[0].details
+    assert [request.method for request in requests] == ["GET", "POST"]
+    assert json.loads(requests[1].content)["method"] == "initialize"
 
 
 def test_explanation_does_not_describe_an_error_as_a_vulnerability():

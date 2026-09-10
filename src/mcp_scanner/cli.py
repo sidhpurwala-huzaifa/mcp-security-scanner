@@ -31,9 +31,9 @@ def main() -> None:
 @click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
 @click.option("--verbose", is_flag=True, default=False, help="Print full request/response trace and leaked data")
 @click.option("--explain", "explain_id", help="Explain a specific finding by ID (e.g., X-01)")
-@click.option("--transport", type=click.Choice(["auto", "http", "sse", "stdio"]), default="auto", show_default=True, help="Preferred transport hint; auto tries SSE when available")
+@click.option("--transport", type=click.Choice(["auto", "http", "sse", "stdio"]), default="auto", show_default=True, help="auto tries legacy SSE only after HTTP initialize returns 404/405")
 @click.option("--only-health", is_flag=True, default=False, help="Dump endpoints, tools, prompts, resources and exit (no scan)")
-@click.option("--sse-endpoint", help="When --transport sse, append this path to --url for SSE (e.g., /sse)")
+@click.option("--sse-endpoint", help="Legacy SSE URL or relative path resolved against --url (e.g., /sse); used by sse and auto fallback")
 @click.option("--auth-type", type=click.Choice(["bearer", "oauth2-client-credentials"]))
 @click.option("--auth-token")
 @click.option("--token-url")
@@ -62,7 +62,7 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
             raise click.ClickException("--command can only be used with --transport stdio")
 
     if transport == "sse":
-        click.echo("SSE is deprecated in MCP!!! SSE support in the scanner is experimental and may not work!!!", err=fmt == "json")
+        click.echo("Legacy HTTP+SSE transport is deprecated; scanner compatibility support is experimental. Streamable HTTP still supports SSE responses.", err=fmt == "json")
     class RealtimeTrace:
         def __init__(self, c: Console) -> None:
             self._c = c
@@ -129,7 +129,7 @@ def scan_cmd(url: str, spec: Optional[str], fmt: str, verbose: bool, explain_id:
     else:
         spec_index = load_spec()
 
-    # Transport hint is advisory; the checker auto-handles SSE vs JSON responses based on Content-Type
+    # HTTP POST responses accept JSON or SSE independently of transport selection.
     if transport == "sse" and "Accept" not in auth_headers:
         auth_headers = {**auth_headers, "Accept": "application/json, text/event-stream"}
     elif transport == "http" and "Accept" not in auth_headers:
@@ -365,7 +365,7 @@ def rpc_cmd(url: str, method: str, params: str, header: list[str], transport: st
     except Exception as e:
         raise click.ClickException(f"Invalid --params JSON: {e}")
     if transport == "sse":
-        console.print("SSE is deprecated in MCP!!! SSE support in the scanner is experimental and may not work!!!")
+        console.print("Legacy HTTP+SSE transport is deprecated; scanner compatibility support is experimental. Streamable HTTP still supports SSE responses.")
     headers: Dict[str, Any] = build_auth_headers(auth_type, auth_token, token_url, client_id, client_secret, scope)
     if session_id:
         headers = {**headers, "Mcp-Session-Id": session_id}

@@ -13,6 +13,64 @@ class SessionError(RuntimeError):
     pass
 
 
+class SSEReader:
+    """Incremental SSE events; retain unread events across legacy POST calls."""
+
+    def __init__(self, response, max_bytes):
+        self.chunks = response.iter_bytes()
+        self.max_bytes = max_bytes
+        self.pending = b""
+        self.size = 0
+        self.first_line = True
+        self.eof = False
+        self.skip_lf = False
+        self.data = []
+        self.event = "message"
+
+    def next_event(self, deadline):
+        while True:
+            if time.monotonic() >= deadline:
+                raise SessionError("Response deadline exceeded")
+            if self.skip_lf and self.pending:
+                self.pending = self.pending.removeprefix(b"\n")
+                self.skip_lf = False
+            delimiter = re.search(b"[\\r\\n]", self.pending)
+            if delimiter is not None:
+                pos = delimiter.start()
+                self.skip_lf = self.pending[pos:pos + 1] == b"\r"
+                line, self.pending = self.pending[:pos], self.pending[pos + 1:]
+                if self.first_line:
+                    line = line.removeprefix(b"\xef\xbb\xbf")
+                    self.first_line = False
+                if not line:
+                    event, data = self.event, self.data
+                    self.event, self.data = "message", []
+                    if data:
+                        try:
+                            return event, b"\n".join(data).decode("utf-8")
+                        except UnicodeError as exc:
+                            raise SessionError("Invalid SSE UTF-8") from exc
+                elif line.startswith(b"data:") or line == b"data":
+                    self.data.append(line[5:].removeprefix(b" "))
+                elif line.startswith(b"event:"):
+                    try:
+                        self.event = line[6:].removeprefix(b" ").decode("utf-8") or "message"
+                    except UnicodeError as exc:
+                        raise SessionError("Invalid SSE event type") from exc
+                continue
+            if self.eof:
+                raise SessionError("SSE stream closed before the expected event")
+            try:
+                chunk = next(self.chunks)
+            except StopIteration:
+                self.eof = True
+                continue
+            self.size += len(chunk)
+            if self.size > self.max_bytes:
+                raise SessionError("Response exceeds size limit")
+            self.pending += chunk
+
+
 class StreamableHttpSession:
     SUPPORTED = ("2025-06-18", "2025-03-26")
     MAX_BYTES = 8 * 1024 * 1024
@@ -52,53 +110,31 @@ class StreamableHttpSession:
                     raise SessionError("Invalid MCP session identifier")
                 self.client.headers["Mcp-Session-Id"] = sid
             content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-            chunks = response.iter_bytes()
-            size = 0
-            pending = b""
-            first_line = True
-            data_lines = []
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise SessionError("Response deadline exceeded")
-                try:
-                    chunk = next(chunks)
-                except StopIteration:
-                    break
+            if content_type == "text/event-stream":
+                reader = SSEReader(response, self.MAX_BYTES)
+                while True:
+                    event, data = reader.next_event(deadline)
+                    if event != "message":
+                        continue
+                    message = self._decode(data)
+                    if self._matches(message, payload["id"], deadline):
+                        return status, message
+            if content_type != "application/json":
+                raise SessionError(f"Unsupported response content type: {content_type}")
+            body = bytearray()
+            for chunk in response.iter_bytes():
                 if time.monotonic() >= deadline:
                     raise SessionError("Response deadline exceeded")
-                size += len(chunk)
-                if size > self.MAX_BYTES:
+                body.extend(chunk)
+                if len(body) > self.MAX_BYTES:
                     raise SessionError("Response exceeds size limit")
-                pending += chunk
-                if content_type == "text/event-stream":
-                    while True:
-                        delimiter = re.search(b"[\\r\\n]", pending)
-                        if delimiter is None:
-                            break
-                        pos = delimiter.start()
-                        if pending[pos:] == b"\r":
-                            break  # CRLF may be split across network chunks.
-                        length = 2 if pending[pos:pos + 2] == b"\r\n" else 1
-                        line, pending = pending[:pos], pending[pos + length:]
-                        if first_line:
-                            line = line.removeprefix(b"\xef\xbb\xbf")
-                            first_line = False
-                        if not line:
-                            if data_lines:
-                                message = self._decode(b"\n".join(data_lines))
-                                data_lines = []
-                                if self._matches(message, payload["id"], deadline):
-                                    return status, message
-                        elif line.startswith(b"data:"):
-                            data_lines.append(line[5:].removeprefix(b" "))
-            if content_type == "application/json":
-                message = self._decode(pending)
-                if self._matches(message, payload["id"], deadline):
-                    return status, message
-            elif content_type != "text/event-stream":
-                raise SessionError(f"Unsupported response content type: {content_type}")
+            message = self._decode(body)
+            if self._matches(message, payload["id"], deadline):
+                return status, message
             raise SessionError("No matching JSON-RPC response received")
+
+    def close(self):
+        self.ready = False
 
     @staticmethod
     def _decode(data):
@@ -118,9 +154,7 @@ class StreamableHttpSession:
                     reply["result"] = {}
                 else:
                     reply["error"] = {"code": -32601, "message": "Method not supported"}
-                with self.client.stream("POST", self.url, json=reply, timeout=max(0.001, deadline - time.monotonic())) as response:
-                    if response.status_code != 202:
-                        raise SessionError("Server did not accept client response")
+                self._send_server_response(reply, deadline)
             return False
         if type(message.get("id")) is not type(request_id) or message.get("id") != request_id:
             return False
@@ -128,6 +162,12 @@ class StreamableHttpSession:
             raise SessionError("Response must contain exactly one result or error")
         self._record(direction="recv", response=message)
         return True
+
+    def _send_server_response(self, reply, deadline):
+        with self.client.stream("POST", self.url, json=reply,
+                                timeout=max(0.001, deadline - time.monotonic())) as response:
+            if response.status_code != 202:
+                raise SessionError("Server did not accept client response")
 
     def initialize(self):
         self.ready = False

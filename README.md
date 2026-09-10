@@ -2,7 +2,7 @@ MCP Security Scanner
 
 This is a Python-based penetration testing tool for Model Context Protocol (MCP) servers. It supports HTTP, stdio, and experimental SSE transports, runs a suite of checks mapped to `scanner_specs.schema` (auth, transport, tools, prompts, resources), and includes a deliberately insecure MCP-like server for testing.
 
-**Note: SSE transport is discontinued in the latest version of MCP. Support for SSE in this tool is purely experimental and may not work!!!**
+**Legacy HTTP+SSE transport is deprecated; compatibility support is experimental. Streamable HTTP continues to support SSE responses.**
 
 
 ## Install
@@ -99,16 +99,20 @@ HTTP health output uses `status: "ok"` or `"error"`, `initialize_http_status`,
 returns `2` on an error and displays unavailable data explicitly.
 
 These reporting gates are the first part of [#18](https://github.com/sidhpurwala-huzaifa/mcp-security-scanner/issues/18).
-Scan, health, and RPC share a Streamable HTTP session for `auto` and `http`.
+Scan, health, and RPC share session handling. `http` selects Streamable HTTP;
+`auto` tries it first and falls back to legacy HTTP+SSE only after an initialize
+POST returns 404 or 405 and a valid legacy endpoint event is received.
 The session accepts JSON or SSE, correlates response IDs, negotiates protocol
 2025-06-18 or 2025-03-26, propagates session/version headers, and sends
 `notifications/initialized` before normal requests. It advertises no optional
 client capabilities. Requests are never automatically replayed after failure.
-SSE responses close as soon as the matching result arrives. Response data is
+Streamable HTTP SSE responses close as soon as the matching result arrives. Response data is
 limited to 8 MiB, with an elapsed budget checked between response chunks and
 HTTPX network timeouts. This is not a strict wall-clock cancellation deadline.
 Discovery continues probing lists even if not advertised, as this is a scanner.
-Legacy transport repair remains separate work. A legacy endpoint discovery event alone no longer
+Legacy SSE keeps the original GET connection open, posts a real initialize to
+the advertised endpoint, and waits for its correlated response on that connection.
+A legacy endpoint discovery event alone no longer
 counts as verified MCP initialization. Existing active-probe verdict heuristics
 and standalone `rpc` behavior are not changed by these gates.
 
@@ -227,10 +231,10 @@ mcp-scan scan \
 ```
 
 ### Transport, timeouts, session
-- **--transport auto|http|stdio|sse**: Hint preferred transport; no dynamic discovery.
+- **--transport auto|http|stdio|sse**: Select transport explicitly or use the bounded fallback described above.
   - `http`: Requires `--url` for JSON-RPC endpoint
   - `stdio`: Requires `--command` for local MCP server process
-  - `sse`: Requires `--url` and `--sse-endpoint` (experimental)
+  - `sse`: Legacy HTTP+SSE at `--url`; optional `--sse-endpoint` resolves a URL/path against it (experimental).
 - **--timeout <seconds>**: Per-request read timeout (default 12s). Increase for slow streams.
 - **--session-id <SID>**: Pre-established session (`Mcp-Session-Id` header).
 
@@ -270,3 +274,27 @@ podman run --rm mcp-scan scan --url ${MCP_SERVER} --format text
 ## Acknowledgements
 - Vulnerability ideas inspired by `Damn Vulnerable MCP Server` - https://github.com/harishsg993010/damn-vulnerable-MCP-server
 - Ye Wang from Red Hat for all his help in resolving `init` problems with certain MCP servers
+
+Legacy HTTP+SSE compatibility (issue #18, part 3)
+
+- Discovery uses the supplied SSE URL and its `endpoint` event. Query parameter
+  names such as `sessionId` never select a transport or fabricate a session header.
+- `--sse-endpoint /sse` resolves from the origin root; a relative path resolves
+  against `--url`. `auto` uses it only after HTTP initialization returns 404/405.
+  Authentication failures, other HTTP failures, malformed initialization, and
+  normal RPC failures do not trigger fallback.
+- The advertised endpoint must have the same origin, without embedded credentials
+  or a fragment. Legacy redirects are rejected; supply the final SSE URL directly.
+- Legacy protocol 2024-11-05 initialization, initialized notifications, and normal
+  replies use the original SSE connection. Both message bodies and headers are
+  handled independently of URL query spelling. Health includes the chosen transport.
+- Disconnects, endpoint rotation, missing replies, and invalid initialization
+  produce errors. Connections close on success and failure; calls are not replayed
+  and streams are not automatically resumed. Start a new scan to reconnect.
+- The shared SSE parser handles comments, multiline data, split UTF-8, CR/LF/CRLF,
+  and unrelated events. The 8 MiB bound applies to each Streamable HTTP response
+  and to the lifetime of a legacy receive stream; elapsed budgets are checked
+  between chunks/events alongside network timeouts, not hard wall-clock cancellation.
+
+References: [legacy transport](https://modelcontextprotocol.io/specification/2024-11-05/basic/transports)
+and [Streamable HTTP backwards compatibility](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#backwards-compatibility).
