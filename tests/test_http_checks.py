@@ -31,11 +31,14 @@ class TestHttpChecksIntegration:
 
         try:
             # Start the insecure server
-            server_process = subprocess.Popen(
-                ["insecure-mcp-server", "--host", "127.0.0.1", "--port", str(server_port)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
+            try:
+                server_process = subprocess.Popen(
+                    ["insecure-mcp-server", "--host", "127.0.0.1", "--port", str(server_port)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+            except FileNotFoundError:
+                pytest.skip("insecure-mcp-server command not available")
 
             # Give the server time to start
             time.sleep(3)
@@ -68,10 +71,6 @@ class TestHttpChecksIntegration:
             # Validate X-03: Tool stability (rug-pull detection)
             x03_findings = [f for f in findings if f.id == "X-03"]
             assert len(x03_findings) == 1
-        except FileNotFoundError:
-            pytest.skip("insecure-mcp-server command not available")
-        except Exception as e:
-            pytest.skip(f"Could not test with insecure server: {e}")
         finally:
             # Clean up - terminate the server process
             if server_process:

@@ -75,6 +75,10 @@ mcp-scan scan --url https://your-mcp.example.com --transport sse --sse-endpoint 
 ### New: RPC passthrough (Inspector-like)
 **Note: RPC commands only support HTTP and SSE transports, not stdio.**
 
+HTTP scanning, RPC, and health checks set `Accept: application/json, text/event-stream`
+for MCP requests, replacing HTTPX's default or a custom `Accept` value. Authentication
+and other custom headers are preserved. SSE GET requests use `Accept: text/event-stream`.
+
 ```bash
 # List tools (HTTP)
 mcp-scan rpc --url https://your-mcp.example.com/mcp --method tools/list --transport http
