@@ -8,6 +8,8 @@ import re
 import time
 from importlib.metadata import PackageNotFoundError, version
 
+from .redaction import redact_secrets
+
 
 class SessionError(RuntimeError):
     pass
@@ -165,12 +167,9 @@ class StreamableHttpSession:
 
     def _sanitize(self, value):
         if isinstance(value, str):
-            for secret in sorted(self.secrets, key=len, reverse=True):
-                if secret:
-                    value = value.replace(secret, "[redacted]")
-            return value
+            return redact_secrets(value, self.secrets)
         if isinstance(value, dict):
-            return {self._sanitize(k): self._sanitize(v) for k, v in value.items()}
+            return {k: self._sanitize(v) for k, v in value.items()}
         if isinstance(value, list):
             return [self._sanitize(v) for v in value]
         return value

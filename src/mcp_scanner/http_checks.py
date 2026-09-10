@@ -1,6 +1,7 @@
 from __future__ import annotations
 from .http_session import HttpSession
 from .probe_outcomes import ProbeOutcome
+from .redaction import redact_secrets
 from contextlib import contextmanager
 
 from typing import Dict, List, Optional, Any, Tuple
@@ -58,16 +59,13 @@ class _DiagnosticHeaders(dict):
 
 
 def _diagnostic(text: str, headers: Optional[Dict[str, str]] = None, limit: Optional[int] = 500) -> str:
-    for secret in sorted(getattr(headers, "secrets", ()), key=len, reverse=True):
-        if secret:
-            for form in (secret, json.dumps(secret)[1:-1]):
-                text = text.replace(form, "[redacted]")
-    # Error messages may echo credentials supplied by the caller.
+    secrets = set(getattr(headers, "secrets", ()))
     for name, value in (headers or {}).items():
         if any(word in name.lower() for word in ("authorization", "cookie", "token", "key", "session")) and value:
-            text = text.replace(value, "[redacted]")
+            secrets.add(value)
             if name.lower() == "authorization" and " " in value:
-                text = text.replace(value.split(" ", 1)[1], "[redacted]")
+                secrets.add(value.split(" ", 1)[1])
+    text = redact_secrets(text, secrets)
     text = re.sub(r"(?i)([?&](?:sessionId|session_id|access_token|token)=)[^&\s]+", r"\1[redacted]", text)
     text = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", text)
     return text[:limit] if limit is not None else text
@@ -76,7 +74,7 @@ def _diagnostic(text: str, headers: Optional[Dict[str, str]] = None, limit: Opti
 def _redact_output(value: Any, headers) -> Any:
     if isinstance(value, dict):
         return {
-            _diagnostic(str(key), headers, limit=None): "[redacted]" if str(key).lower() in {
+            key: "[redacted]" if str(key).lower() in {
                 "authorization", "proxy-authorization", "cookie", "set-cookie",
                 "mcp-session-id", "session_id", "sessionid", "x-api-key", "access_token",
             } else _redact_output(item, headers)

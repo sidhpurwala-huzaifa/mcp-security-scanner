@@ -147,3 +147,49 @@ def test_redaction_secrets_are_isolated_between_calls(monkeypatch):
     second = http_checks.rpc_call('https://test/mcp', 'ping', {}, transport='http')
     assert first['result']['value'] == '[redacted]'
     assert second['result']['value'] == token
+
+
+@pytest.mark.parametrize('token', ['a', 'id', 'status', 'capabilities'])
+def test_review_short_session_ids_preserve_health_and_rpc_contract(monkeypatch, token):
+    def handle(request):
+        p = json.loads(request.content)
+        if p['method'] == 'initialize': return init(p, {'Mcp-Session-Id': token})
+        if p['method'] == 'notifications/initialized': return httpx.Response(202)
+        if p['method'].endswith('/list'): return ok(p, {p['method'].split('/')[0]: []})
+        return ok(p, {'status': 'available', 'capabilities': {}, 'echo': token})
+    install(monkeypatch, handle)
+    trace = []
+    health = http_checks.get_server_health('https://test/mcp', transport='http', trace=trace, verbose=True)
+    assert health['base_url'] == 'https://test/mcp'
+    assert health['status'] == 'ok'
+    assert health['initialize']['result']['capabilities'] == {}
+    assert health['enumeration_status'] == {'tools': 'ok', 'resources': 'ok', 'prompts': 'ok'}
+    result = http_checks.rpc_call('https://test/mcp', 'ping', {}, transport='http')
+    assert result['jsonrpc'] == '2.0'
+    assert result['result'] == {'status': 'available', 'capabilities': {}, 'echo': '[redacted]'}
+    assert all('direction' in entry and 'transport' in entry for entry in trace)
+
+
+@pytest.mark.parametrize('secrets', [{'a'}, {'a', 'redacted'}, {'secret-123', 'secret'}, {'quote-"token"'}])
+def test_redaction_is_idempotent_and_does_not_change_keys(secrets):
+    from src.mcp_scanner.redaction import redact_secrets
+    headers = http_checks._DiagnosticHeaders({})
+    headers.secrets.update(secrets)
+    text = ' '.join(sorted(secrets))
+    once = redact_secrets(text, secrets)
+    assert redact_secrets(once, secrets) == once
+    data = {'capabilities': {secret: secret for secret in secrets}, 'status': 'available'}
+    redacted = http_checks._redact_output(data, headers)
+    assert set(redacted) == set(data)
+    assert set(redacted['capabilities']) == secrets
+    assert set(redacted['capabilities'].values()) == {'[redacted]'}
+
+
+def test_short_secret_diagnostics_keep_words_and_redact_echoes():
+    headers = http_checks._DiagnosticHeaders({'Mcp-Session-Id': 'a'})
+    headers.secrets.add('a')
+    text = 'Invalid session a; capabilities available; sessionId=a'
+    result = http_checks._diagnostic(text, headers)
+    assert result == 'Invalid session [redacted]; capabilities available; sessionId=[redacted]'
+    # Recognized query credentials are redacted regardless of length.
+    assert http_checks._diagnostic('https://test/mcp?sessionId=a', headers).endswith('sessionId=[redacted]')

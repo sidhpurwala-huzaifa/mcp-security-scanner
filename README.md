@@ -318,3 +318,11 @@ keeps an isolated secret set containing supplied credentials and learned session
 identifiers (including legacy endpoint tokens); it is shared with verbose traces
 and final scan/health/RPC output. Redaction occurs after evidence evaluation so
 it does not turn a detected exposure into a pass.
+
+Redaction preserves dictionary keys to keep protocol/report structure intact.
+Short secrets (fewer than eight characters) are matched as complete values or
+word-delimited tokens, avoiding corruption of ordinary words. Recognized secret
+fields and token query parameters remain redacted. Raw and JSON-escaped forms
+are deduplicated and replaced in one pass; existing redaction markers are stable.
+Substring occurrences of short identifiers inside unrelated words are inherently
+ambiguous and are deliberately left unchanged.
