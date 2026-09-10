@@ -12,6 +12,15 @@ from .spec import SpecCheck
 from . import security_checks
 
 
+def _set_mcp_http_headers(client: httpx.Client) -> None:
+    # HTTPX installs Accept: */* by default, so membership checks and setdefault
+    # cannot enforce MCP's required POST response types (issue #14). Assign via
+    # HTTPX's case-insensitive Headers to replace user-supplied variants too.
+    # SSE GET requests retain their explicit text/event-stream override.
+    client.headers["Accept"] = "application/json, text/event-stream"
+    client.headers.setdefault("MCP-Protocol-Version", "2025-06-18")
+
+
 def _finding(spec: SpecCheck, passed: bool, details: str) -> Finding:
     return Finding(
         id=spec.id,
@@ -116,10 +125,7 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout),
         headers=headers or {},
     )
-    # Ensure required headers for Streamable HTTP compatibility
-    if "Accept" not in client.headers:
-        client.headers["Accept"] = "application/json, text/event-stream"
-    client.headers.setdefault("MCP-Protocol-Version", "2025-06-18")
+    _set_mcp_http_headers(client)
 
     # Cache discovered message URL and working SSE URL (legacy) and allow refresh from inner helpers
     msg_url_cache: Optional[str] = None
@@ -861,8 +867,7 @@ def rpc_call(base_url: str, method: str, params: Dict[str, Any], headers: Option
         timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout),
         headers=headers or {},
     )
-    client.headers.setdefault("Accept", "application/json, text/event-stream")
-    client.headers.setdefault("MCP-Protocol-Version", "2025-06-18")
+    _set_mcp_http_headers(client)
 
     msg_url_cache: Optional[str] = None
     sse_url_cache: Optional[str] = None
@@ -1170,8 +1175,7 @@ def get_server_health(base_url: str, headers: Optional[Dict[str, str]] = None, t
         timeout=httpx.Timeout(connect=3.0, read=timeout, write=timeout, pool=timeout),
         headers=headers or {},
     )
-    client.headers.setdefault("Accept", "application/json, text/event-stream")
-    client.headers.setdefault("MCP-Protocol-Version", "2025-06-18")
+    _set_mcp_http_headers(client)
     msg_url_cache: Optional[str] = None
     sse_url_cache: Optional[str] = None
     # Persistent SSE state for legacy servers
