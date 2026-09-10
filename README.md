@@ -7,6 +7,25 @@ This is a Python-based penetration testing tool for Model Context Protocol (MCP)
 
 ## Install
 
+### Install a tagged release
+
+Tag `0.1.1` has a known packaging defect: the default scan schema is missing from
+the installed package ([#13](https://github.com/sidhpurwala-huzaifa/mcp-security-scanner/issues/13)).
+The published [`0.1.2` release](https://github.com/sidhpurwala-huzaifa/mcp-security-scanner/releases/tag/0.1.2)
+contains the schema fix. Install it in your virtual environment with:
+
+```bash
+python -m pip install --upgrade "git+https://github.com/sidhpurwala-huzaifa/mcp-security-scanner.git@0.1.2"
+python -c "from mcp_scanner.spec import load_spec; print(f'Loaded {len(load_spec())} checks')"
+```
+
+The historical `0.1.2` tag declares package version `0.1.3`; this metadata mismatch
+does not affect schema loading. The tag is preserved as published. This release
+predates the HTTP Accept-header fix in [#17](https://github.com/sidhpurwala-huzaifa/mcp-security-scanner/pull/17);
+use the current source checkout below if you need that fix too.
+
+### Install from source
+
 ```bash
 # 1) Clone
 git clone https://github.com/sidhpurwala-huzaifa/mcp-security-scanner
@@ -22,6 +41,22 @@ pip install -r requirements.txt
 # 4) (Optional) Dev install for CLI entrypoints
 pip install -e .
 ```
+
+### Verify release packaging
+
+An editable install can hide missing package data. To check actual distributions
+from a clean checkout:
+
+```bash
+python -m pip install build
+python -m build
+python scripts/check_distribution.py dist
+```
+
+The check requires one wheel and one source distribution in `dist/`. It verifies
+both contain the schema, then installs the wheel into a temporary virtual
+environment and loads the default checks outside the checkout. CI runs this check
+on pull requests, main-branch pushes, and tag pushes.
 
 
 ## Usage
