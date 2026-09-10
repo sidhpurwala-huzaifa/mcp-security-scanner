@@ -78,6 +78,7 @@ class StreamableHttpSession:
     def __init__(self, client, url, timeout=12.0, trace=None):
         self.client, self.url, self.timeout, self.trace = client, url, timeout, trace
         self.ready = False
+        self.secrets = set()
         self.initialize_status = None
         self.capabilities = {}
         self._next_id = 1000  # Keep intentional scanner probe IDs separate.
@@ -103,11 +104,12 @@ class StreamableHttpSession:
                     raise SessionError(f"Notification was not accepted (HTTP {status})")
                 return status, None
             if not 200 <= status < 300:
-                return status, {"error": f"HTTP {status}"}
+                return status, self._error_body(response, deadline)
             sid = response.headers.get("Mcp-Session-Id")
             if sid is not None and payload.get("id") == 0:
                 if not sid or any(ord(c) < 33 or ord(c) > 126 for c in sid):
                     raise SessionError("Invalid MCP session identifier")
+                self.secrets.add(sid)
                 self.client.headers["Mcp-Session-Id"] = sid
             content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
             if content_type == "text/event-stream":
@@ -132,6 +134,46 @@ class StreamableHttpSession:
             if self._matches(message, payload["id"], deadline):
                 return status, message
             raise SessionError("No matching JSON-RPC response received")
+
+    def _error_body(self, response, deadline):
+        """Retain bounded HTTP diagnostics; never consume an endless error stream."""
+        body = bytearray()
+        limit = 16 * 1024
+        truncated = False
+        try:
+            for chunk in response.iter_bytes():
+                if time.monotonic() >= deadline:
+                    truncated = True
+                    break
+                room = limit - len(body)
+                body.extend(chunk[:room])
+                if len(chunk) >= room:
+                    truncated = True
+                    break
+        except Exception as exc:
+            return {"error": {"message": f"HTTP {response.status_code}; error body unavailable: {type(exc).__name__}"}}
+        try:
+            parsed = json.loads(body)
+        except (ValueError, UnicodeError):
+            parsed = {"message": body.decode("utf-8", errors="replace") or f"HTTP {response.status_code}"}
+        error = parsed.get("error", parsed) if isinstance(parsed, dict) else parsed
+        data = {"error": error}
+        if truncated:
+            data["diagnostic_truncated"] = True
+        # Sanitize before diagnostics cross the session boundary.
+        return self._sanitize(data)
+
+    def _sanitize(self, value):
+        if isinstance(value, str):
+            for secret in sorted(self.secrets, key=len, reverse=True):
+                if secret:
+                    value = value.replace(secret, "[redacted]")
+            return value
+        if isinstance(value, dict):
+            return {self._sanitize(k): self._sanitize(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._sanitize(v) for v in value]
+        return value
 
     def close(self):
         self.ready = False

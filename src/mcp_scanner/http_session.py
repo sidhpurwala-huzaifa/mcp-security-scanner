@@ -1,6 +1,6 @@
 """Explicit transport selection and the legacy HTTP+SSE session lifecycle."""
 import time
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, parse_qs
 
 import httpx
 
@@ -58,6 +58,9 @@ class LegacySseSession(StreamableHttpSession):
                     if not data.strip() or any(c.isspace() or ord(c) < 32 for c in data):
                         raise SessionError("Malformed legacy endpoint event")
                     self.url = same_origin_endpoint(self.sse_url, data)
+                    for key, values in parse_qs(urlsplit(self.url).query).items():
+                        if key.lower() in ("sessionid", "session_id", "token", "access_token"):
+                            self.secrets.update(values)
                     break
             return super().initialize()
         except Exception:
@@ -72,6 +75,7 @@ class LegacySseSession(StreamableHttpSession):
                                 timeout=max(0.001, deadline - time.monotonic()),
                                 follow_redirects=False) as response:
             self._record(direction="recv", status=response.status_code)
+            self._last_post_error = self._error_body(response, deadline) if not 200 <= response.status_code < 300 else None
             return response.status_code
 
     def exchange(self, payload):
@@ -85,7 +89,7 @@ class LegacySseSession(StreamableHttpSession):
             if not 200 <= status < 300:
                 if "id" not in payload:
                     raise SessionError(f"Notification was not accepted (HTTP {status})")
-                return status, {"error": f"HTTP {status}"}
+                return status, self._last_post_error
             if "id" not in payload:
                 return status, None
             while True:
@@ -115,15 +119,17 @@ class LegacySseSession(StreamableHttpSession):
 
 class HttpSession:
     """Select once at initialization; never fall back after normal RPC begins."""
-    def __init__(self, client, url, timeout=12.0, trace=None, transport="auto", sse_endpoint=None):
+    def __init__(self, client, url, timeout=12.0, trace=None, transport="auto", sse_endpoint=None, secrets=None):
         if transport not in ("auto", "http", "sse"):
             raise ValueError("Unsupported HTTP transport")
+        self.secrets = secrets if secrets is not None else set()
         self.client, self.base_url = client, url
         self.timeout, self.trace, self.mode = timeout, trace, transport
         self.sse_url = same_origin_endpoint(url, sse_endpoint) if sse_endpoint else url
         self.transport = "sse" if transport == "sse" else "http"
         cls = LegacySseSession if transport == "sse" else StreamableHttpSession
         self.active = cls(client, self.sse_url if transport == "sse" else url, timeout, trace)
+        self.active.secrets = self.secrets
 
     @property
     def url(self):
@@ -143,6 +149,7 @@ class HttpSession:
                 raise
             self.active.close()
             self.active = LegacySseSession(self.client, self.sse_url, self.timeout, self.trace)
+            self.active.secrets = self.secrets
             self.transport = "sse"
             return self.active.initialize()
 

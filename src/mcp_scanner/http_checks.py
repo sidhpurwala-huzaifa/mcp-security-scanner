@@ -1,5 +1,7 @@
 from __future__ import annotations
 from .http_session import HttpSession
+from .probe_outcomes import ProbeOutcome
+from contextlib import contextmanager
 
 from typing import Dict, List, Optional, Any, Tuple
 import json
@@ -43,7 +45,23 @@ def _unevaluated(spec: SpecCheck, status: Outcome, details: str) -> Finding:
     )
 
 
-def _diagnostic(text: str, headers: Optional[Dict[str, str]] = None) -> str:
+class _DiagnosticHeaders(dict):
+    """A private copy of caller headers plus secrets learned during this scan."""
+    def __init__(self, headers):
+        super().__init__(headers or {})
+        self.secrets = set()
+        for name, value in self.items():
+            if value and any(word in name.lower() for word in ("authorization", "cookie", "token", "key", "session")):
+                self.secrets.add(value)
+                if name.lower() == "authorization" and " " in value:
+                    self.secrets.add(value.split(" ", 1)[1])
+
+
+def _diagnostic(text: str, headers: Optional[Dict[str, str]] = None, limit: Optional[int] = 500) -> str:
+    for secret in sorted(getattr(headers, "secrets", ()), key=len, reverse=True):
+        if secret:
+            for form in (secret, json.dumps(secret)[1:-1]):
+                text = text.replace(form, "[redacted]")
     # Error messages may echo credentials supplied by the caller.
     for name, value in (headers or {}).items():
         if any(word in name.lower() for word in ("authorization", "cookie", "token", "key", "session")) and value:
@@ -51,32 +69,33 @@ def _diagnostic(text: str, headers: Optional[Dict[str, str]] = None) -> str:
             if name.lower() == "authorization" and " " in value:
                 text = text.replace(value.split(" ", 1)[1], "[redacted]")
     text = re.sub(r"(?i)([?&](?:sessionId|session_id|access_token|token)=)[^&\s]+", r"\1[redacted]", text)
-    return re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", text)[:500]
+    text = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", text)
+    return text[:limit] if limit is not None else text
+
+
+def _redact_output(value: Any, headers) -> Any:
+    if isinstance(value, dict):
+        return {
+            _diagnostic(str(key), headers, limit=None): "[redacted]" if str(key).lower() in {
+                "authorization", "proxy-authorization", "cookie", "set-cookie",
+                "mcp-session-id", "session_id", "sessionid", "x-api-key", "access_token",
+            } else _redact_output(item, headers)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_output(item, headers) for item in value]
+    if isinstance(value, str):
+        return _diagnostic(value, headers, limit=None)
+    return value
 
 
 class _RedactedTrace:
-    """Sanitize transport diagnostics before storing or printing them."""
+    """Sanitize before storing or printing, using the live session secret set."""
+    def __init__(self, target: Any, headers):
+        self.target, self.headers = target, headers
 
-    def __init__(self, target: Any, headers: Optional[Dict[str, str]]) -> None:
-        self.target = target
-        self.headers = headers
-
-    def append(self, entry: Dict[str, Any]) -> None:
-        def redact(value: Any) -> Any:
-            if isinstance(value, dict):
-                return {
-                    key: "[redacted]" if str(key).lower() in {
-                        "authorization", "proxy-authorization", "cookie", "set-cookie",
-                        "mcp-session-id", "session_id", "sessionid", "x-api-key", "access_token",
-                    } else redact(item)
-                    for key, item in value.items()
-                }
-            if isinstance(value, list):
-                return [redact(item) for item in value]
-            if isinstance(value, str):
-                return _diagnostic(value, self.headers)
-            return value
-        self.target.append(redact(entry))
+    def append(self, entry):
+        self.target.append(_redact_output(entry, self.headers))
 
 
 def _response_problem(status: Optional[int], data: Any, expected_id: int) -> Optional[str]:
@@ -221,6 +240,7 @@ def scan_http_base(base_url: str, spec_index: Dict[str, SpecCheck], headers: Opt
 
 
 def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], headers: Optional[Dict[str, str]] = None, trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False, timeout: float = 12.0, transport: str = "auto", sse_endpoint: Optional[str] = None) -> List[Finding]:
+    headers = _DiagnosticHeaders(headers)
     if trace is not None:
         trace = _RedactedTrace(trace, headers)
     findings: List[Finding] = []
@@ -233,7 +253,7 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         headers=headers or {},
     )
     _set_mcp_http_headers(client)
-    session = HttpSession(client, base_url, timeout, trace if verbose else None, transport, sse_endpoint)
+    session = HttpSession(client, base_url, timeout, trace if verbose else None, transport, sse_endpoint, secrets=headers.secrets)
 
     def _post_json(url: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
         # Endpoint ownership belongs to the initialized session. The internal
@@ -254,6 +274,27 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
             init_status = session.initialize_status
             init_error = f"HTTP {init_status}; {type(exc).__name__}: {exc}"
             return None, {}
+
+    current_check = None
+    probe_problems = {}
+
+    @contextmanager
+    def probe_boundary(check):
+        nonlocal current_check
+        current_check = check.id
+        probe_problems[check.id] = []
+        try:
+            yield
+        except Exception as exc:
+            probe_problems[check.id].append(_diagnostic(f"{type(exc).__name__}: {exc}", headers))
+        finally:
+            problems = probe_problems[check.id]
+            if problems:
+                # An error body must not be interpreted as exploitation evidence
+                # or as proof that a security control rejected the request.
+                findings[:] = [f for f in findings if f.id != check.id]
+                findings.append(_unevaluated(check, Outcome.error, _diagnostic("; ".join(problems), headers)))
+            current_check = None
 
     try:
         # T-02/T-01/KF-03
@@ -297,39 +338,66 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         # A-01: Unauthenticated access (probe again without auth only if headers were provided)
         a01 = spec_index.get("A-01")
         if a01:
-            try:
-                status, data = _post_json(msg_url_cache, {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}})
-                is_denied = status in (401, 403)
-                details = f"status={status}, body={(json.dumps(data)[:200] + '...') if isinstance(data, (dict, list)) else (str(data)[:200] + '...')}"
-                findings.append(_finding(a01, passed=is_denied, details=details))
-            except Exception as e:
-                findings.append(_unevaluated(a01, Outcome.error, _diagnostic(f"{type(e).__name__}: {e}", headers)))
+            with probe_boundary(a01):
+                try:
+                    status, data = _post_json(msg_url_cache, {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}})
+                    if status not in (401, 403):
+                        problem = ProbeOutcome(status, data).problem()
+                        if problem:
+                            raise RuntimeError(problem)
+                    is_denied = status in (401, 403)
+                    details = f"status={status}, body={(json.dumps(data)[:200] + '...') if isinstance(data, (dict, list)) else (str(data)[:200] + '...')}"
+                    findings.append(_finding(a01, passed=is_denied, details=details))
+                except Exception as e:
+                    findings.append(_unevaluated(a01, Outcome.error, _diagnostic(f"{type(e).__name__}: {e}", headers)))
 
         # T-03: Session identifier handling (best-effort)
         t03 = spec_index.get("T-03")
         if t03:
-            try:
-                # For legacy SSE sessions, skip tampering to avoid invalidating the server session
-                if session.transport == "sse":
-                    findings.append(_unevaluated(t03, Outcome.skipped, "Session tampering skipped on legacy SSE transport"))
-                else:
-                    status_init, _ = _post_json(msg_url_cache, {"jsonrpc": "2.0", "id": 4, "method": "initialize", "params": {}})
-                    sess_ok = status_init < 500
-                    bad_headers = httpx.Headers(client.headers)
-                    bad_headers["Mcp-Session-Id"] = "tampered-session"
-                    if verbose and trace is not None:
-                        trace.append({"transport": "http", "direction": "send", "request": {"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}, "url": msg_url_cache, "note": "altered session id"})
-                    with client.stream("POST", msg_url_cache, json={"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}, headers=bad_headers) as bad:
-                        pass  # This probe needs only the status, never an open SSE body.
-                    rejects_bad = bad.status_code in (401, 403, 400)
-                    findings.append(_finding(t03, passed=(sess_ok and rejects_bad), details=f"bad_status={bad.status_code}"))
-            except Exception as e:
-                findings.append(_unevaluated(t03, Outcome.error, _diagnostic(f"{type(e).__name__}: {e}", headers)))
+            with probe_boundary(t03):
+                try:
+                    # For legacy SSE sessions, skip tampering to avoid invalidating the server session
+                    if session.transport == "sse":
+                        findings.append(_unevaluated(t03, Outcome.skipped, "Session tampering skipped on legacy SSE transport"))
+                    else:
+                        status_init, init_probe = _post_json(msg_url_cache, {"jsonrpc": "2.0", "id": 4, "method": "initialize", "params": {}})
+                        if status_init not in (400, 401, 403):
+                            problem = ProbeOutcome(status_init, init_probe).problem(denied_rpc_codes=(-32600, -32602))
+                            if problem:
+                                raise RuntimeError(problem)
+                        sess_ok = True
+                        bad_headers = httpx.Headers(client.headers)
+                        bad_headers["Mcp-Session-Id"] = "tampered-session"
+                        if verbose and trace is not None:
+                            trace.append({"transport": "http", "direction": "send", "request": {"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}, "url": msg_url_cache, "note": "altered session id"})
+                        with client.stream("POST", msg_url_cache, json={"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}, headers=bad_headers) as bad:
+                            pass  # This probe needs only the status, never an open SSE body.
+                        if bad.status_code not in (400, 401, 403) and not 200 <= bad.status_code < 300:
+                            raise RuntimeError(f"HTTP {bad.status_code}; session probe could not be evaluated")
+                        rejects_bad = bad.status_code in (401, 403, 400)
+                        findings.append(_finding(t03, passed=(sess_ok and rejects_bad), details=f"bad_status={bad.status_code}"))
+                except Exception as e:
+                    findings.append(_unevaluated(t03, Outcome.error, _diagnostic(f"{type(e).__name__}: {e}", headers)))
 
         # rpc using discovered endpoint only
         def rpc(method: str, params: Dict[str, object]) -> Dict[str, object]:
-            status, data = _post_json(msg_url_cache, {"jsonrpc": "2.0", "id": 99, "method": method, "params": params})
-            return data if isinstance(data, dict) else {"status": status, "body": data}
+            try:
+                status, data = _post_json(msg_url_cache, {"jsonrpc": "2.0", "id": 99, "method": method, "params": params})
+                outcome = ProbeOutcome(status, data)
+            except Exception as exc:
+                outcome = ProbeOutcome(None, transport_error=f"{type(exc).__name__}: {exc}")
+            # Only these deliberate negative probes have explicit rejection
+            # semantics. Other errors (including generic tool errors) are unknown.
+            denials = (401, 403) if current_check in {"R-01", "R-02", "RC-01", "R-03", "R-04", "R-05"} else ()
+            codes = (-32602,) if current_check == "P-01" and method == "prompts/get" else ()
+            problem = outcome.problem(denied_statuses=denials, denied_rpc_codes=codes)
+            if problem:
+                probe_problems[current_check].append(_diagnostic(method + ": " + problem, headers))
+                # Do not feed server error strings into vulnerability heuristics.
+                return {"error": "Probe could not be evaluated"}
+            if outcome.http_status in denials or (isinstance(outcome.data, dict) and "error" in outcome.data):
+                return {"error": "Expected probe rejection"}
+            return outcome.data
 
         # BASE-01 already done; record it properly
         base = spec_index.get("BASE-01")
@@ -359,28 +427,29 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         # RC-01: Remote access control exposure
         rc01 = spec_index.get("RC-01")
         if rc01 and isinstance(tools, list):
-            if len(tools) == 0:
-                findings.append(_unevaluated(rc01, Outcome.skipped, "tools/list succeeded: no applicable tools"))
-            else:
-                candidates: List[Dict[str, Any]] = []
-                for t in tools:
-                    name = (t.get("name") or "").lower()
-                    desc = (t.get("description") or "").lower()
-                    if any(k in name for k in ["remote_access", "remote", "port"]) or any(k in desc for k in ["remote access", "open port", "expose", "bind"]):
-                        candidates.append(t)
-                # Attempt unauthenticated call if a known name is present
-                exploited = []
-                for t in candidates:
-                    tname = t.get("name")
-                    if tname:
-                        try:
-                            resp = rpc("tools/call", {"name": tname, "arguments": {"port": 8080}})
-                            text = json.dumps(resp).lower()
-                            if any(s in text for s in ["remote_access_enabled:true", "remote-access:true", "enabled"]):
-                                exploited.append({"tool": tname, "resp": resp})
-                        except Exception:
-                            continue
-                findings.append(_finding(rc01, passed=len(exploited) == 0, details=json.dumps({"candidates": candidates, "exploited": exploited})))
+            with probe_boundary(rc01):
+                if len(tools) == 0:
+                    findings.append(_unevaluated(rc01, Outcome.skipped, "tools/list succeeded: no applicable tools"))
+                else:
+                    candidates: List[Dict[str, Any]] = []
+                    for t in tools:
+                        name = (t.get("name") or "").lower()
+                        desc = (t.get("description") or "").lower()
+                        if any(k in name for k in ["remote_access", "remote", "port"]) or any(k in desc for k in ["remote access", "open port", "expose", "bind"]):
+                            candidates.append(t)
+                    # Attempt unauthenticated call if a known name is present
+                    exploited = []
+                    for t in candidates:
+                        tname = t.get("name")
+                        if tname:
+                            try:
+                                resp = rpc("tools/call", {"name": tname, "arguments": {"port": 8080}})
+                                text = json.dumps(resp).lower()
+                                if any(s in text for s in ["remote_access_enabled:true", "remote-access:true", "enabled"]):
+                                    exploited.append({"tool": tname, "resp": resp})
+                            except Exception:
+                                continue
+                    findings.append(_finding(rc01, passed=len(exploited) == 0, details=json.dumps({"candidates": candidates, "exploited": exploited})))
 
         # X-03 Rug-pull
         x03 = spec_index.get("X-03")
@@ -403,47 +472,48 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         # P-01 Prompt argument validation
         p01 = spec_index.get("P-01")
         if p01:
-            p01_issues: List[Dict[str, Any]] = []
-            try:
-                prompts = enumerate_items("prompts", ("P-01",))
-                for pr in prompts or []:
-                    name = pr.get("name")
-                    schema = pr.get("inputSchema") or {}
-                    required = schema.get("required") or []
-                    # Probe missing required args
-                    if name and isinstance(required, list) and len(required) > 0:
-                        bad_call = rpc("prompts/get", {"name": name, "arguments": {}})
-                        # Expect an error when required args are missing
-                        if isinstance(bad_call, dict) and "result" in bad_call and "error" not in bad_call:
-                            p01_issues.append({"prompt": name, "issue": "missing-required-accepted", "resp": bad_call})
-                        else:
-                            # Also try invalid type for the first required key if we can infer type
-                            first_key = required[0]
-                            props = (schema.get("properties") or {}) if isinstance(schema, dict) else {}
-                            expected_type = (props.get(first_key, {}).get("type") if isinstance(props, dict) else None)
-                            invalid_value: Any = None
-                            if expected_type == "string":
-                                invalid_value = 12345
-                            elif expected_type == "integer":
-                                invalid_value = "not-an-integer"
-                            elif expected_type == "boolean":
-                                invalid_value = "not-a-bool"
-                            elif expected_type == "array":
-                                invalid_value = {"not": "array"}
-                            elif expected_type == "object":
-                                invalid_value = "not-an-object"
+            with probe_boundary(p01):
+                p01_issues: List[Dict[str, Any]] = []
+                try:
+                    prompts = enumerate_items("prompts", ("P-01",))
+                    for pr in prompts or []:
+                        name = pr.get("name")
+                        schema = pr.get("inputSchema") or {}
+                        required = schema.get("required") or []
+                        # Probe missing required args
+                        if name and isinstance(required, list) and len(required) > 0:
+                            bad_call = rpc("prompts/get", {"name": name, "arguments": {}})
+                            # Expect an error when required args are missing
+                            if isinstance(bad_call, dict) and "result" in bad_call and "error" not in bad_call:
+                                p01_issues.append({"prompt": name, "issue": "missing-required-accepted", "resp": bad_call})
                             else:
-                                invalid_value = None
-                            if invalid_value is not None:
-                                bad_args = {first_key: invalid_value}
-                                bad_call2 = rpc("prompts/get", {"name": name, "arguments": bad_args})
-                                if isinstance(bad_call2, dict) and "result" in bad_call2 and "error" not in bad_call2:
-                                    p01_issues.append({"prompt": name, "issue": "invalid-type-accepted", "resp": bad_call2})
-                # If no prompts are present, treat as pass (nothing to validate)
-                if "P-01" in spec_index:
-                    findings.append(_finding(p01, passed=len(p01_issues) == 0, details=json.dumps(p01_issues)) if prompts else _unevaluated(p01, Outcome.skipped, "prompts/list succeeded: no applicable prompts"))
-            except Exception as e:
-                findings.append(_unevaluated(p01, Outcome.error, _diagnostic(f"{type(e).__name__}: {e}", headers)))
+                                # Also try invalid type for the first required key if we can infer type
+                                first_key = required[0]
+                                props = (schema.get("properties") or {}) if isinstance(schema, dict) else {}
+                                expected_type = (props.get(first_key, {}).get("type") if isinstance(props, dict) else None)
+                                invalid_value: Any = None
+                                if expected_type == "string":
+                                    invalid_value = 12345
+                                elif expected_type == "integer":
+                                    invalid_value = "not-an-integer"
+                                elif expected_type == "boolean":
+                                    invalid_value = "not-a-bool"
+                                elif expected_type == "array":
+                                    invalid_value = {"not": "array"}
+                                elif expected_type == "object":
+                                    invalid_value = "not-an-object"
+                                else:
+                                    invalid_value = None
+                                if invalid_value is not None:
+                                    bad_args = {first_key: invalid_value}
+                                    bad_call2 = rpc("prompts/get", {"name": name, "arguments": bad_args})
+                                    if isinstance(bad_call2, dict) and "result" in bad_call2 and "error" not in bad_call2:
+                                        p01_issues.append({"prompt": name, "issue": "invalid-type-accepted", "resp": bad_call2})
+                    # If no prompts are present, treat as pass (nothing to validate)
+                    if "P-01" in spec_index:
+                        findings.append(_finding(p01, passed=len(p01_issues) == 0, details=json.dumps(p01_issues)) if prompts else _unevaluated(p01, Outcome.skipped, "prompts/list succeeded: no applicable prompts"))
+                except Exception as e:
+                    findings.append(_unevaluated(p01, Outcome.error, _diagnostic(f"{type(e).__name__}: {e}", headers)))
 
         # X-01 risky unconstrained tools
         x01 = spec_index.get("X-01")
@@ -456,41 +526,44 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         # R-01 traversal & R-02 sensitive path
         r01 = spec_index.get("R-01")
         if r01:
-            attempt = rpc("resources/read", {"uri": "file:///../../etc/hosts"})
-            accepted = isinstance(attempt, dict) and "result" in attempt and isinstance(attempt.get("result"), dict)
-            findings.append(_finding(r01, passed=not accepted, details=json.dumps(attempt)))
+            with probe_boundary(r01):
+                attempt = rpc("resources/read", {"uri": "file:///../../etc/hosts"})
+                accepted = isinstance(attempt, dict) and "result" in attempt and isinstance(attempt.get("result"), dict)
+                findings.append(_finding(r01, passed=not accepted, details=json.dumps(attempt)))
         r02 = spec_index.get("R-02")
         if r02:
-            attempt2 = rpc("resources/read", {"uri": "file:///etc/passwd"})
-            accepted2 = isinstance(attempt2, dict) and "result" in attempt2 and isinstance(attempt2.get("result"), dict)
-            findings.append(_finding(r02, passed=not accepted2, details=json.dumps(attempt2)))
+            with probe_boundary(r02):
+                attempt2 = rpc("resources/read", {"uri": "file:///etc/passwd"})
+                accepted2 = isinstance(attempt2, dict) and "result" in attempt2 and isinstance(attempt2.get("result"), dict)
+                findings.append(_finding(r02, passed=not accepted2, details=json.dumps(attempt2)))
 
         # X-02 fuzz tools/call
         x02 = spec_index.get("X-02")
         if x02 and isinstance(tools, list):
-            if len(tools) == 0:
-                findings.append(_unevaluated(x02, Outcome.skipped, "tools/list succeeded: no applicable tools"))
-            else:
-                payloads = ["; id", "$(whoami)", "`uname - a`", "../../../../etc/passwd", "http://169.254.169.254/latest/meta-data/"]
-                observed: List[Dict[str, Any]] = []
-                for t in tools:
-                    name = t.get("name")
-                    schema = t.get("inputSchema") or {}
-                    props = schema.get("properties") or {}
-                    str_param = None
-                    for pn, p in (props.items() if isinstance(props, dict) else []):
-                        if (p.get("type") == "string"):
-                            str_param = pn
-                            break
-                    if not (name and str_param):
-                        continue
-                    for pl in payloads:
-                        resp = rpc("tools/call", {"name": name, "arguments": {str_param: pl}})
-                        text = json.dumps(resp).lower()
-                        if any(key in text for key in ["uid=", "linux", "root:x:", "etc/passwd", "meta-data", "insecure", "stdout"]):
-                            observed.append({"tool": name, "payload": pl, "resp": resp})
-                            break
-                findings.append(_finding(x02, passed=len(observed) == 0, details=json.dumps(observed)))
+            with probe_boundary(x02):
+                if len(tools) == 0:
+                    findings.append(_unevaluated(x02, Outcome.skipped, "tools/list succeeded: no applicable tools"))
+                else:
+                    payloads = ["; id", "$(whoami)", "`uname - a`", "../../../../etc/passwd", "http://169.254.169.254/latest/meta-data/"]
+                    observed: List[Dict[str, Any]] = []
+                    for t in tools:
+                        name = t.get("name")
+                        schema = t.get("inputSchema") or {}
+                        props = schema.get("properties") or {}
+                        str_param = None
+                        for pn, p in (props.items() if isinstance(props, dict) else []):
+                            if (p.get("type") == "string"):
+                                str_param = pn
+                                break
+                        if not (name and str_param):
+                            continue
+                        for pl in payloads:
+                            resp = rpc("tools/call", {"name": name, "arguments": {str_param: pl}})
+                            text = json.dumps(resp).lower()
+                            if any(key in text for key in ["uid=", "linux", "root:x:", "etc/passwd", "meta-data", "insecure", "stdout"]):
+                                observed.append({"tool": name, "payload": pl, "resp": resp})
+                                break
+                    findings.append(_finding(x02, passed=len(observed) == 0, details=json.dumps(observed)))
 
         # Resources listing
         resources = enumerate_items("resources", ("R-03", "R-04", "R-05", "P-03"))
@@ -498,136 +571,144 @@ def run_full_http_checks(base_url: str, spec_index: Dict[str, SpecCheck], header
         # R-03 sensitive exposure
         r03 = spec_index.get("R-03")
         if r03:
-            sensitive_keywords = ["credential", "secret", "token", "key", "password"]
-            suspects: List[Dict[str, Any]] = []
-            for r in resources or []:
-                name = (r.get("name") or "").lower()
-                uri = (r.get("uri") or "").lower()
-                if any(k in name or k in uri for k in sensitive_keywords):
-                    if r.get("uri"):
-                        resp = rpc("resources/read", {"uri": r["uri"]})
-                        text = json.dumps(resp).lower()
-                        if any(x in text for x in ["password", "apikey", "api key", "sk-", "postgresql://", "username:"]):
-                            suspects.append({"resource": r, "resp": resp})
-                    else:
-                        suspects.append({"resource": r, "resp": None})
-            findings.append(_finding(r03, passed=len(suspects) == 0, details=json.dumps(suspects)) if resources else _unevaluated(r03, Outcome.skipped, "resources/list succeeded: no applicable resources"))
+            with probe_boundary(r03):
+                sensitive_keywords = ["credential", "secret", "token", "key", "password"]
+                suspects: List[Dict[str, Any]] = []
+                for r in resources or []:
+                    name = (r.get("name") or "").lower()
+                    uri = (r.get("uri") or "").lower()
+                    if any(k in name or k in uri for k in sensitive_keywords):
+                        if r.get("uri"):
+                            resp = rpc("resources/read", {"uri": r["uri"]})
+                            text = json.dumps(resp).lower()
+                            if any(x in text for x in ["password", "apikey", "api key", "sk-", "postgresql://", "username:"]):
+                                suspects.append({"resource": r, "resp": resp})
+                        else:
+                            suspects.append({"resource": r, "resp": None})
+                findings.append(_finding(r03, passed=len(suspects) == 0, details=json.dumps(suspects)) if resources else _unevaluated(r03, Outcome.skipped, "resources/list succeeded: no applicable resources"))
 
         # R-05 private
         r05 = spec_index.get("R-05")
         if r05:
-            leaks: List[Dict[str, Any]] = []
-            for r in resources or []:
-                uri = r.get("uri")
-                if isinstance(uri, str) and uri.startswith("private://"):
-                    resp = rpc("resources/read", {"uri": uri})
-                    text = json.dumps(resp).lower()
-                    if any(x in text for x in ["secret", "token", "password"]):
-                        leaks.append({"resource": r, "resp": resp})
-            findings.append(_finding(r05, passed=len(leaks) == 0, details=json.dumps(leaks)) if resources else _unevaluated(r05, Outcome.skipped, "resources/list succeeded: no applicable resources"))
+            with probe_boundary(r05):
+                leaks: List[Dict[str, Any]] = []
+                for r in resources or []:
+                    uri = r.get("uri")
+                    if isinstance(uri, str) and uri.startswith("private://"):
+                        resp = rpc("resources/read", {"uri": uri})
+                        text = json.dumps(resp).lower()
+                        if any(x in text for x in ["secret", "token", "password"]):
+                            leaks.append({"resource": r, "resp": resp})
+                findings.append(_finding(r05, passed=len(leaks) == 0, details=json.dumps(leaks)) if resources else _unevaluated(r05, Outcome.skipped, "resources/list succeeded: no applicable resources"))
 
         # R-04 templates
         r04 = spec_index.get("R-04")
         if r04:
-            templates = [r for r in resources or [] if isinstance(r, dict) and r.get("uriTemplate")]
-            issues: List[Dict[str, Any]] = []
-            for r in templates:
-                tmpl: str = r.get("uriTemplate")
-                if isinstance(tmpl, str) and "{" in tmpl and "}" in tmpl:
-                    if tmpl.startswith("notes://"):
-                        probe = "notes://admin"
-                    else:
-                        base_t = tmpl.split("{", 1)[0]
-                        probe = base_t + "test"
-                    resp = rpc("resources/read", {"uri": probe})
-                    text = json.dumps(resp)
-                    if ("No notes found for user:" in text) or ("Notes for" in text) or (isinstance(resp, dict) and resp.get("result")):
-                        issues.append({"template": tmpl, "probe": probe, "resp": resp})
-            findings.append(_finding(r04, passed=len(issues) == 0, details=json.dumps(issues)) if resources else _unevaluated(r04, Outcome.skipped, "resources/list succeeded: no applicable resources"))
+            with probe_boundary(r04):
+                templates = [r for r in resources or [] if isinstance(r, dict) and r.get("uriTemplate")]
+                issues: List[Dict[str, Any]] = []
+                for r in templates:
+                    tmpl: str = r.get("uriTemplate")
+                    if isinstance(tmpl, str) and "{" in tmpl and "}" in tmpl:
+                        if tmpl.startswith("notes://"):
+                            probe = "notes://admin"
+                        else:
+                            base_t = tmpl.split("{", 1)[0]
+                            probe = base_t + "test"
+                        resp = rpc("resources/read", {"uri": probe})
+                        text = json.dumps(resp)
+                        if ("No notes found for user:" in text) or ("Notes for" in text) or (isinstance(resp, dict) and resp.get("result")):
+                            issues.append({"template": tmpl, "probe": probe, "resp": resp})
+                findings.append(_finding(r04, passed=len(issues) == 0, details=json.dumps(issues)) if resources else _unevaluated(r04, Outcome.skipped, "resources/list succeeded: no applicable resources"))
 
         # P-03 Indirect prompt injection via external resources
         p03 = spec_index.get("P-03")
         if p03:
-            p03_hits: List[Dict[str, Any]] = []
-            try:
-                # Identify external-like resources
-                external_candidates = [
-                    r for r in (resources or [])
-                    if isinstance(r, dict) and isinstance(r.get("uri"), str)
-                    and (
-                        r["uri"].startswith("external://")
-                        or r["uri"].startswith("http://")
-                        or r["uri"].startswith("https://")
-                    )
-                ]
-                # Simple heuristics of injection phrases
-                inj_patterns = [
-                    "ignore previous instructions",
-                    "do not disclose",
-                    "exfiltrate",
-                    "send secrets",
-                    "hidden instruction",
-                    "override",
-                    "leak",
-                ]
-                # Find a summarize-like tool
-                summarize_tool: Optional[str] = None
-                for t in tools or []:
-                    name = (t.get("name") or "").lower()
-                    desc = (t.get("description") or "").lower()
-                    if any(k in name for k in ["summarize", "summary"]) or any(k in desc for k in ["summarize", "summary"]):
-                        summarize_tool = t.get("name")
-                        break
-                for r in external_candidates:
-                    uri = r.get("uri")
-                    read = rpc("resources/read", {"uri": uri})
-                    text = json.dumps(read).lower()
-                    suspicious = any(p in text for p in inj_patterns)
-                    exploited = False
-                    summary_resp: Any = None
-                    if summarize_tool:
-                        try:
-                            summary_resp = rpc("tools/call", {"name": summarize_tool, "arguments": {"uri": uri}})
-                            stext = json.dumps(summary_resp).lower()
-                            if any(p in stext for p in inj_patterns) or any(k in stext for k in ["secret", "token", "password"]):
-                                exploited = True
-                        except Exception:
-                            pass
-                    if suspicious or exploited:
-                        p03_hits.append({
-                            "resource": r,
-                            "suspicious": suspicious,
-                            "exploited": exploited,
-                            "resource_read": read,
-                            "summary": summary_resp,
-                        })
-                findings.append(_finding(p03, passed=len(p03_hits) == 0, details=json.dumps(p03_hits)) if external_candidates else _unevaluated(p03, Outcome.skipped, "resources/list succeeded: no applicable external resources"))
-            except Exception as e:
-                findings.append(_unevaluated(p03, Outcome.error, _diagnostic(f"{type(e).__name__}: {e}", headers)))
+            with probe_boundary(p03):
+                p03_hits: List[Dict[str, Any]] = []
+                try:
+                    # Identify external-like resources
+                    external_candidates = [
+                        r for r in (resources or [])
+                        if isinstance(r, dict) and isinstance(r.get("uri"), str)
+                        and (
+                            r["uri"].startswith("external://")
+                            or r["uri"].startswith("http://")
+                            or r["uri"].startswith("https://")
+                        )
+                    ]
+                    # Simple heuristics of injection phrases
+                    inj_patterns = [
+                        "ignore previous instructions",
+                        "do not disclose",
+                        "exfiltrate",
+                        "send secrets",
+                        "hidden instruction",
+                        "override",
+                        "leak",
+                    ]
+                    # Find a summarize-like tool
+                    summarize_tool: Optional[str] = None
+                    for t in tools or []:
+                        name = (t.get("name") or "").lower()
+                        desc = (t.get("description") or "").lower()
+                        if any(k in name for k in ["summarize", "summary"]) or any(k in desc for k in ["summarize", "summary"]):
+                            summarize_tool = t.get("name")
+                            break
+                    for r in external_candidates:
+                        uri = r.get("uri")
+                        read = rpc("resources/read", {"uri": uri})
+                        text = json.dumps(read).lower()
+                        suspicious = any(p in text for p in inj_patterns)
+                        exploited = False
+                        summary_resp: Any = None
+                        if summarize_tool:
+                            try:
+                                summary_resp = rpc("tools/call", {"name": summarize_tool, "arguments": {"uri": uri}})
+                                stext = json.dumps(summary_resp).lower()
+                                if any(p in stext for p in inj_patterns) or any(k in stext for k in ["secret", "token", "password"]):
+                                    exploited = True
+                            except Exception:
+                                pass
+                        if suspicious or exploited:
+                            p03_hits.append({
+                                "resource": r,
+                                "suspicious": suspicious,
+                                "exploited": exploited,
+                                "resource_read": read,
+                                "summary": summary_resp,
+                            })
+                    findings.append(_finding(p03, passed=len(p03_hits) == 0, details=json.dumps(p03_hits)) if external_candidates else _unevaluated(p03, Outcome.skipped, "resources/list succeeded: no applicable external resources"))
+                except Exception as e:
+                    findings.append(_unevaluated(p03, Outcome.error, _diagnostic(f"{type(e).__name__}: {e}", headers)))
 
         # A-03 token pass-through via tool
         a03 = spec_index.get("A-03")
         if a03:
-            leak = rpc("tools/call", {"name": "upstream_access", "arguments": {"code": "dummy"}})
-            text = json.dumps(leak).lower()
-            leaked = any(k in text for k in ["access_token", "sk-", "token-body", "bearer "])
-            findings.append(_finding(a03, passed=not leaked, details=json.dumps(leak)))
+            with probe_boundary(a03):
+                leak = rpc("tools/call", {"name": "upstream_access", "arguments": {"code": "dummy"}})
+                text = json.dumps(leak).lower()
+                leaked = any(k in text for k in ["access_token", "sk-", "token-body", "bearer "])
+                findings.append(_finding(a03, passed=not leaked, details=json.dumps(leak)))
 
     finally:
+        for finding in findings:
+            finding.details = _diagnostic(finding.details, headers, limit=None)
         session.close()
         client.close()
     return findings
 
 
 def rpc_call(base_url: str, method: str, params: Dict[str, Any], headers: Optional[Dict[str, str]] = None, trace: Optional[List[Dict[str, Any]]] = None, verbose: bool = False, timeout: float = 12.0, transport: str = "auto", sse_endpoint: Optional[str] = None) -> Dict[str, Any]:
+    headers = _DiagnosticHeaders(headers)
     if trace is not None:
         trace = _RedactedTrace(trace, headers)
     with httpx.Client(follow_redirects=True, timeout=timeout, headers=headers or {}) as client:
-        session = HttpSession(client, base_url, timeout, trace if verbose else None, transport, sse_endpoint)
+        session = HttpSession(client, base_url, timeout, trace if verbose else None, transport, sse_endpoint, secrets=headers.secrets)
         try:
             session.initialize()
             status, data = session.call(method, params)
-            return data if isinstance(data, dict) else {"status": status, "body": data}
+            return _redact_output(data if isinstance(data, dict) else {"status": status, "body": data}, headers)
         except Exception as exc:
             return {"error": _diagnostic(f"{type(exc).__name__}: {exc}", headers)}
         finally:
@@ -640,6 +721,7 @@ def get_server_health(base_url: str, headers: Optional[Dict[str, str]] = None, t
     Unavailable lists are None; successfully retrieved empty lists are [].
     Legacy endpoint discovery alone is not accepted as initialization.
     """
+    headers = _DiagnosticHeaders(headers)
     if trace is not None:
         trace = _RedactedTrace(trace, headers)
     init_status: Optional[int] = None
@@ -650,7 +732,7 @@ def get_server_health(base_url: str, headers: Optional[Dict[str, str]] = None, t
         headers=headers or {},
     )
     _set_mcp_http_headers(client)
-    session = HttpSession(client, base_url, timeout, trace if verbose else None, transport, sse_endpoint)
+    session = HttpSession(client, base_url, timeout, trace if verbose else None, transport, sse_endpoint, secrets=headers.secrets)
 
     def _post_json(url: str, payload: Dict[str, Any]) -> Tuple[int, Any]:
         # Endpoint ownership belongs to the initialized session. The internal
@@ -687,7 +769,7 @@ def get_server_health(base_url: str, headers: Optional[Dict[str, str]] = None, t
         problem = init_error or _initialization_problem(init_status, init_obj)
         if problem or init_url is None:
             health["errors"]["initialize"] = _diagnostic(problem or "No endpoint discovered", headers)
-            return health
+            return _redact_output(health, headers)
         health.update(msg_url=_diagnostic(init_url, headers), initialize=init_obj, status="ok")
         for key in ("tools", "prompts", "resources"):
             method = key + "/list"
@@ -705,7 +787,7 @@ def get_server_health(base_url: str, headers: Optional[Dict[str, str]] = None, t
             else:
                 health["enumeration_status"][key] = "ok"
                 health[key] = data["result"][key]
-        return health
+        return _redact_output(health, headers)
     finally:
         session.close()
         client.close()
